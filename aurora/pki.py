@@ -153,21 +153,16 @@ def validate_identity(ca_cert: str = CA_CERT, server_cert: str = SERVER_CERT,
 
 
 def replace_ca_approved(approved: bool, ca_key: str = CA_KEY,
-                        ca_cert: str = CA_CERT, server_key: str = SERVER_KEY,
-                        server_cert: str = SERVER_CERT) -> None:
+                        ca_cert: str = CA_CERT) -> None:
     """Controlled CA replacement: explicit approval required, old files
-    backed up with a .replaced-<ts> suffix first. Server cert/key are
-    invalidated together (they chain to the replaced CA)."""
+    backed up with a .replaced-<ts> suffix first."""
     if not approved:
         raise PKIError("CA replacement requires explicit approval")
     import time
     ts = int(time.time())
-    for p in (ca_key, ca_cert, server_key, server_cert):
+    for p in (ca_key, ca_cert, SERVER_KEY, SERVER_CERT):
         if os.path.exists(p):
-            try:
-                os.replace(p, f"{p}.replaced-{ts}")
-            except OSError as e:
-                raise PKIError(f"cannot replace {p}: {e}")
+            os.replace(p, f"{p}.replaced-{ts}")
 
 
 def ca_bytes(ca_cert: str = CA_CERT) -> bytes:

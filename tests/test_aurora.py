@@ -393,11 +393,7 @@ class TestRealPKI:
         f.write_text("x")
         old = str(tmp_path / "aurora-manager-ca.pem")
         f.rename(old)
-        (tmp_path / "sk").write_text("s")
-        (tmp_path / "sc").write_text("s")
-        pki.replace_ca_approved(True, ca_cert=old, ca_key=str(tmp_path / "k"),
-                                server_key=str(tmp_path / "sk"),
-                                server_cert=str(tmp_path / "sc"))
+        pki.replace_ca_approved(True, ca_cert=old, ca_key=str(tmp_path / "k"))
         assert not os.path.exists(old)  # renamed to .replaced-<ts>
 
 
