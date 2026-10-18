@@ -1,6 +1,6 @@
 # Aurora IKEv2 Manager
 
-![license](https://img.shields.io/badge/license-MIT-blue) ![platform](https://img.shields.io/badge/platform-Ubuntu%2020.04%2B-orange) ![tests](https://img.shields.io/badge/tests-42%20passing-brightgreen)
+![license](https://img.shields.io/badge/license-MIT-blue) ![platform](https://img.shields.io/badge/platform-Ubuntu%2020.04%2B-orange) ![tests](https://img.shields.io/badge/tests-76%20unit%20%2B%2015%20E2E-brightgreen)
 
 > **Scope:** user management is supported for **classic `ipsec.conf` /
 > `ipsec.secrets`** installs and for **swanctl/VICI** installs with
@@ -83,6 +83,27 @@ Full guide: [docs/android-setup.md](docs/android-setup.md)
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Common failures and fixes |
 | [docs/uninstall.md](docs/uninstall.md) | Clean removal |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
+
+## Certificate layout
+
+| Item | Path / name |
+|---|---|
+| CA private key | `/etc/ipsec.d/private/aurora-manager-ca-key.pem` (0600) |
+| **CA certificate (public)** | `/etc/ipsec.d/cacerts/aurora-manager-ca.pem` (0644) |
+| Server private key | `/etc/ipsec.d/private/aurora-server-key.pem` (0600) |
+| Server certificate | `/etc/ipsec.d/certs/aurora-server-cert.pem` (0644) |
+| Dashboard download name | **`aurora-manager-ca.pem`** (exact public CA bytes) |
+
+Everything is generated automatically by `install.sh` — no manual
+certificate or secrets work. A pre-existing CA is never replaced without
+typing `REPLACE-CA` at a confirmation prompt. The downloaded CA is the exact
+file strongSwan loads; it is the public certificate only and is identical
+for every user of the server.
+
+**Not tested:** the official strongSwan Android app has NOT been verified
+against a real connection to an Aurora-installed server (no live server test
+was performed). Certificate/SAN format follows the app's documented
+requirements (SAN matching the server address, serverAuth flag, IKEv2 EAP).
 
 ## Test results
 

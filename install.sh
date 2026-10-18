@@ -110,6 +110,20 @@ fi
 backup /etc/ipsec.conf
 backup /etc/ipsec.secrets
 
+# ---------- conflict detection on fresh installs ----------
+if [[ "$MODE" == "fresh" ]]; then
+  if [[ -f /etc/ipsec.conf ]] && grep -qv "^\s*$" /etc/ipsec.conf 2>/dev/null \
+     && ! grep -q "aurora-begin" /etc/ipsec.conf 2>/dev/null; then
+    warn "fresh install requested but /etc/ipsec.conf already contains a"
+    warn "non-Aurora configuration. Existing conns are preserved (Aurora only"
+    warn "appends its own block), but review: consider --mode existing instead."
+  fi
+  if [[ -f /etc/swanctl/swanctl.conf ]]; then
+    warn "swanctl config detected; fresh install will manage the classic stack."
+    warn "Existing swanctl configuration is not modified."
+  fi
+fi
+
 # ---------- package installation ----------
 step "installing packages"
 export DEBIAN_FRONTEND=noninteractive
@@ -117,33 +131,90 @@ apt-get update -qq
 apt-get install -y -qq strongswan strongswan-pki libcharon-extra-plugins \
   libstrongswan-extra-plugins python3-venv python3-pip curl >/dev/null
 
-# ---------- certificates ----------
-if [[ ! -f /etc/ipsec.d/cacerts/ca-cert.pem ]]; then
-  step "generating CA and server certificate"
-  mkdir -p /etc/ipsec.d/{private,cacerts,certs}
-  ipsec pki --gen --type rsa --size 4096 --outform pem > /etc/ipsec.d/private/ca-key.pem
-  chmod 600 /etc/ipsec.d/private/ca-key.pem
-  ipsec pki --self --ca --lifetime 3650 --in /etc/ipsec.d/private/ca-key.pem \
-    --type rsa --dn "CN=Aurora VPN CA" --outform pem > /etc/ipsec.d/cacerts/ca-cert.pem
-  ipsec pki --gen --type rsa --size 2048 --outform pem > /etc/ipsec.d/private/server-key.pem
-  chmod 600 /etc/ipsec.d/private/server-key.pem
-  ipsec pki --pub --in /etc/ipsec.d/private/server-key.pem --type rsa \
-    --san "$PUBLIC_IP" --san "@$PUBLIC_IP" \
-    --flag serverAuth --lifetime 1200 \
-    --cacert /etc/ipsec.d/cacerts/ca-cert.pem \
-    --dn "CN=$PUBLIC_IP" --outform pem > /etc/ipsec.d/certs/server-cert.pem
-else
-  log "CA already exists — keeping it."
-  if [[ "$MODE" == "reinstall" ]]; then
-    log "regenerating server certificate for new identity $PUBLIC_IP..."
-    ipsec pki --gen --type rsa --size 2048 --outform pem > /etc/ipsec.d/private/server-key.pem
-    chmod 600 /etc/ipsec.d/private/server-key.pem
-    ipsec pki --pub --in /etc/ipsec.d/private/server-key.pem --type rsa \
-      --san "$PUBLIC_IP" --san "@$PUBLIC_IP" \
+# ---------- certificates (standard filenames) ----------
+CA_KEY=/etc/ipsec.d/private/aurora-manager-ca-key.pem
+CA_CERT=/etc/ipsec.d/cacerts/aurora-manager-ca.pem
+SERVER_KEY=/etc/ipsec.d/private/aurora-server-key.pem
+SERVER_CERT=/etc/ipsec.d/certs/aurora-server-cert.pem
+
+gen_server_cert() {
+  ipsec pki --gen --type rsa --size 2048 --outform pem > "$SERVER_KEY"
+  chmod 600 "$SERVER_KEY"
+  ipsec pki --pub --in "$SERVER_KEY" --type rsa \
+    | ipsec pki --issue --san "$PUBLIC_IP" --san "@$PUBLIC_IP" \
       --flag serverAuth --lifetime 1200 \
-      --cacert /etc/ipsec.d/cacerts/ca-cert.pem \
-      --dn "CN=$PUBLIC_IP" --outform pem > /etc/ipsec.d/certs/server-cert.pem
+      --cacert "$CA_CERT" --cakey "$CA_KEY" \
+      --dn "CN=$PUBLIC_IP" --outform pem > "$SERVER_CERT"
+  chmod 644 "$SERVER_CERT"
+}
+
+validate_certs() {
+  if ! openssl verify -CAfile "$CA_CERT" "$SERVER_CERT" >/dev/null 2>&1; then
+    err "server certificate is NOT signed by $CA_CERT — chain broken"
+    return 1
   fi
+  if ! openssl x509 -in "$SERVER_CERT" -noout -checkend 2592000; then
+    err "server certificate expired or expires within 30 days"
+    return 1
+  fi
+  local CMOD KMOD
+  CMOD=$(openssl x509 -in "$SERVER_CERT" -noout -modulus | md5sum)
+  KMOD=$(openssl rsa  -in "$SERVER_KEY"  -noout -modulus | md5sum)
+  if [[ "$CMOD" != "$KMOD" ]]; then
+    err "server certificate and private key do NOT match"
+    return 1
+  fi
+  # SAN must contain the client-facing identity
+  if ! openssl x509 -in "$SERVER_CERT" -noout -text | grep -q "$PUBLIC_IP"; then
+    err "certificate SAN does not contain $PUBLIC_IP"
+    return 1
+  fi
+  return 0
+}
+
+if [[ "$MODE" != "panel-only" ]]; then
+  step "certificates (aurora-manager-ca.pem)"
+  mkdir -p /etc/ipsec.d/{private,cacerts,certs}
+  if [[ ! -f "$CA_CERT" ]]; then
+    log "generating new CA..."
+    ipsec pki --gen --type rsa --size 4096 --outform pem > "$CA_KEY"
+    chmod 600 "$CA_KEY"
+    ipsec pki --self --ca --lifetime 3650 --in "$CA_KEY" \
+      --type rsa --dn "CN=Aurora VPN Manager CA" --outform pem > "$CA_CERT"
+    chmod 644 "$CA_CERT"
+  elif [[ "$MODE" == "reinstall" ]]; then
+    warn "CA already exists at $CA_CERT."
+    read -r -p "REPLACE the existing CA (invalidates all client trust)? Type REPLACE-CA or ENTER to keep: " CA_ANSWER
+    if [[ "$CA_ANSWER" == "REPLACE-CA" ]]; then
+      TS=$(date +%s)
+      for F in "$CA_KEY" "$CA_CERT" "$SERVER_KEY" "$SERVER_CERT"; do
+        [[ -f "$F" ]] && mv "$F" "$F.replaced-$TS"
+      done
+      ipsec pki --gen --type rsa --size 4096 --outform pem > "$CA_KEY"
+      chmod 600 "$CA_KEY"
+      ipsec pki --self --ca --lifetime 3650 --in "$CA_KEY" \
+        --type rsa --dn "CN=Aurora VPN Manager CA" --outform pem > "$CA_CERT"
+      chmod 644 "$CA_CERT"
+    else
+      log "keeping existing CA."
+    fi
+  else
+    log "CA already exists at $CA_CERT — keeping it (use --mode reinstall + REPLACE-CA to change)."
+  fi
+  if [[ ! -f "$SERVER_CERT" ]]; then
+    gen_server_cert
+  else
+    # existing server cert: verify identity still matches, regenerate if not
+    if ! openssl x509 -in "$SERVER_CERT" -noout -text | grep -q "$PUBLIC_IP"; then
+      warn "existing server cert does not match identity $PUBLIC_IP — regenerating server certificate."
+      gen_server_cert
+    fi
+  fi
+  if ! validate_certs; then
+    err "certificate validation failed — see backups in $BACKUP_DIR"
+    exit 1
+  fi
+  log "PKI validated: chain OK, key match OK, SAN contains $PUBLIC_IP."
 fi
 
 # ---------- ipsec.conf ----------
@@ -165,7 +236,7 @@ conn $CONN
     leftid=@${PUBLIC_IP}
     leftsubnet=0.0.0.0/0
     leftauth=pubkey
-    leftcert=server-cert.pem
+    leftcert=aurora-server-cert.pem
     right=%any
     rightsourceip=10.99.0.0/24
     rightauth=eap-mschapv2
@@ -356,7 +427,7 @@ fi
 
 log "done."
 log "panel:  http://127.0.0.1:8080  (behind nginx+TLS for remote access)"
-log "CA cert for clients: /etc/ipsec.d/cacerts/ca-cert.pem (download via panel /setup)"
+log "CA cert for clients: $CA_CERT (download as aurora-manager-ca.pem via panel /setup)"
 if [[ "$SWANCTL_MODE" == true ]]; then
   warn "swanctl install detected: user management DISABLED (read-only panel)."
 fi

@@ -256,7 +256,13 @@ def enable_user(username: str, path: str = DEFAULT_SECRETS_FILE) -> bool:
 # ------------------------------------------------------------- apply/recover
 
 def load_secrets() -> None:
-    """`swanctl --load-secrets` — no daemon restart, no SA disruption."""
+    """`swanctl --load-secrets` — no daemon restart, no SA disruption.
+
+    AURORA_SKIP_RELOAD=1 (sandbox/E2E testing only) skips the vici call —
+    file state is still fully validated.
+    """
+    if os.environ.get("AURORA_SKIP_RELOAD") == "1":
+        return
     run_ok(effective_cmd(["/usr/sbin/swanctl", "--load-secrets"]), timeout=30)
 
 

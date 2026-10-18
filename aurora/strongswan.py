@@ -29,8 +29,17 @@ SWANCTL_CONF = "/etc/swanctl/swanctl.conf"
 
 def stack_layout(
         swanctl_conf: str = "/etc/swanctl/swanctl.conf",
-        ipsec_conf: str = IPSEC_CONF) -> str:
-    """'classic' | 'swanctl' | 'none' — which strongSwan config layout exists."""
+        ipsec_conf: str = IPSEC_CONF,
+        secrets_dir: str = "/etc/swanctl/secrets") -> str:
+    """'classic' | 'swanctl' | 'none' — reliable backend detection.
+
+    swanctl wins only when swanctl.conf exists (a bare secrets dir or
+    leftover binary is not enough); classic when ipsec.conf exists.
+    An env override (AURORA_FORCE_BACKEND) exists for testing.
+    """
+    forced = os.environ.get("AURORA_FORCE_BACKEND")
+    if forced in ("classic", "swanctl"):
+        return forced
     if os.path.exists(swanctl_conf):
         return "swanctl"
     if os.path.exists(ipsec_conf):
@@ -213,7 +222,7 @@ conn {CONN_NAME}
     leftid=@{public_ip}
     leftsubnet=0.0.0.0/0
     leftauth=pubkey
-    leftcert=server-cert.pem
+    leftcert=aurora-server-cert.pem
     right=%any
     rightsourceip={pool}
     rightauth=eap-mschapv2

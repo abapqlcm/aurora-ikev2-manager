@@ -5,15 +5,18 @@
   <ol>
     <li>Install the official <strong>strongSwan VPN Client</strong> from Google Play.</li>
     <li>Download the CA certificate:
-        <a href="{{ url_for('download_ca') }}">aurora-vpn-ca.crt</a>
-        (requires panel login).</li>
+        <a href="{{ url_for('download_ca') }}">{{ pki.DOWNLOAD_NAME }}</a>
+        (requires panel login). This is the <strong>public</strong> CA
+        certificate used to verify the VPN server's identity — it contains
+        no secrets and is the same for all users of this server.</li>
     <li>Android Settings → Encryption &amp; credentials → Install a certificate → CA certificate → pick the downloaded file.</li>
     <li>In the strongSwan app: Add profile
         <ul>
           <li>Server: <code>{{ env.public_ip or 'YOUR_SERVER_IP' }}</code></li>
           <li>Type: <code>IKEv2 EAP (Username/Password)</code></li>
           <li>Username / password: as provided by the admin</li>
-          <li>CA certificate: select <em>Aurora VPN CA</em></li>
+          <li>CA certificate: select the Aurora CA you installed
+              (<code>aurora-manager-ca.pem</code>)</li>
         </ul></li>
     <li>Connect. First connection may take a few seconds.</li>
   </ol>

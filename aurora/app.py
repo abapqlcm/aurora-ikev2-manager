@@ -339,16 +339,31 @@ def create_app() -> Flask:
     @login_required
     def client_setup():
         env = detect_environment()
-        return render_template("setup.html", env=env)
+        from . import pki
+        return render_template("setup.html", env=env, pki=pki)
 
-    @app.route("/ca.crt")
+    @app.route("/ca.pem")
+    @app.route("/ca.crt")  # legacy alias, same certificate
     @login_required
     def download_ca():
-        path = os.environ.get("AURORA_CA_PATH", "/etc/ipsec.d/cacerts/ca-cert.pem")
-        if not os.path.isfile(path):
-            abort(404, "CA certificate not found")
-        return send_file(path, mimetype="application/x-x509-ca-cert",
-                         as_attachment=True, download_name="aurora-vpn-ca.crt")
+        """Serve the exact public CA cert under the standard name.
+        The path is fixed (aurora/pki.CA_CERT) — no user input touches it,
+        so path traversal is impossible. Private keys are never exposed:
+        they live in /etc/ipsec.d/private/ and no route reads from there."""
+        from . import pki
+        try:
+            data = pki.ca_bytes(pki.CA_CERT)
+        except OSError:
+            abort(404, "CA certificate not found on this server — "
+                       "expected at " + pki.CA_CERT)
+        if b"BEGIN CERTIFICATE" not in data:
+            abort(500, "CA file at " + pki.CA_CERT +
+                       " is not a valid PEM certificate")
+        import io
+        return send_file(io.BytesIO(data),
+                         mimetype="application/x-pem-file",
+                         as_attachment=True,
+                         download_name=pki.DOWNLOAD_NAME)
 
     # JSON status endpoint (authenticated)
     @app.route("/api/status")

@@ -131,7 +131,7 @@ aurora-ikev2{3}:  INSTALLED, TUNNEL, ESP in UDP, 10.99.0.1/32 === 5.6.7.8/32
         assert sessions[0].remote_ip == "5.6.7.8"
 
     def test_empty_when_down(self, monkeypatch):
-        monkeypatch.setattr(strongswan, "service_active", lambda: False)
+        monkeypatch.setattr(monitor, "service_active", lambda: False)
         rep = monitor.get_status()
         assert rep.service_active is False
         assert rep.sessions == []
@@ -529,3 +529,183 @@ class TestSwanctlWebIntegration:
             "action": "add", "username": "nouser", "password": "NoPass1234",
             "csrf": csrf})
         assert r.status_code == 302  # redirected with flash, nothing written
+
+
+# --------------------------------------------------- PKI integration (v1.3)
+
+import shutil
+import subprocess
+import tempfile
+
+import pytest
+
+from aurora import pki
+
+HAVE_PKI = shutil.which("/usr/sbin/ipsec") is not None and os.path.isdir("/etc/ipsec.d")
+
+
+@pytest.mark.skipif(not HAVE_PKI, reason="strongswan-pki not installed")
+class TestRealPKI:
+    """REAL certificate generation with strongSwan pki — isolated under tmp."""
+
+    @pytest.fixture()
+    def pki_env(self, tmp_path):
+        ca_key = str(tmp_path / "aurora-manager-ca-key.pem")
+        ca_cert = str(tmp_path / "aurora-manager-ca.pem")
+        s_key = str(tmp_path / "aurora-server-key.pem")
+        s_cert = str(tmp_path / "aurora-server-cert.pem")
+        yield ca_key, ca_cert, s_key, s_cert
+
+    def test_generate_ca_and_server_cert_real(self, pki_env):
+        ca_key, ca_cert, s_key, s_cert = pki_env
+        pki.generate_ca(ca_key, ca_cert)
+        pki.generate_server_cert("203.0.113.10", ca_key, ca_cert, s_key, s_cert)
+        # files exist with right content type
+        assert b"BEGIN CERTIFICATE" in open(ca_cert, "rb").read()
+        assert b"PRIVATE KEY" in open(ca_key, "rb").read()
+        # restrictive perms
+        assert (os.stat(ca_key).st_mode & 0o777) == 0o600
+        assert (os.stat(s_key).st_mode & 0o777) == 0o600
+
+    def test_chain_and_key_match_real(self, pki_env):
+        ca_key, ca_cert, s_key, s_cert = pki_env
+        pki.generate_ca(ca_key, ca_cert)
+        pki.generate_server_cert("vpn.example.com", ca_key, ca_cert, s_key, s_cert)
+        res = pki.validate_pki(ca_cert, s_cert, s_key)
+        assert res["chain_ok"] is True
+        assert res["key_match"] is True
+        assert res["expiry_ok"] is True
+        assert (res["expiry_days"] or 0) > 365
+
+    def test_identity_in_san_real(self, pki_env):
+        ca_key, ca_cert, s_key, s_cert = pki_env
+        pki.generate_ca(ca_key, ca_cert)
+        pki.generate_server_cert("198.51.100.7", ca_key, ca_cert, s_key, s_cert)
+        assert pki.validate_identity(ca_cert, s_cert, "198.51.100.7")
+        assert not pki.validate_identity(ca_cert, s_cert, "10.9.9.9")
+
+    def test_wrong_key_rejected_real(self, pki_env):
+        ca_key, ca_cert, s_key, s_cert = pki_env
+        pki.generate_ca(ca_key, ca_cert)
+        pki.generate_server_cert("203.0.113.10", ca_key, ca_cert, s_key, s_cert)
+        # replace server key with a fresh unrelated one -> mismatch
+        subprocess.run(["/usr/sbin/ipsec", "pki", "--gen", "--type", "rsa",
+                        "--size", "2048", "--outform", "pem"],
+                       stdout=open(s_key, "wb"), check=True)
+        res = pki.validate_pki(ca_cert, s_cert, s_key)
+        assert res["key_match"] is False
+
+    def test_ca_refusal_to_overwrite(self, pki_env):
+        ca_key, ca_cert, s_key, s_cert = pki_env
+        pki.generate_ca(ca_key, ca_cert)
+        with pytest.raises(pki.PKIError, match="refusing to overwrite"):
+            pki.generate_ca(ca_key, ca_cert)
+
+    def test_invalid_identity_rejected(self, pki_env):
+        ca_key, ca_cert, s_key, s_cert = pki_env
+        pki.generate_ca(ca_key, ca_cert)
+        for bad in ("", "a/b", "..", "x y"):
+            with pytest.raises(pki.PKIError, match="invalid server identity"):
+                pki.generate_server_cert(bad, ca_key, ca_cert, s_key, s_cert)
+
+    def test_replace_ca_requires_approval(self, tmp_path):
+        with pytest.raises(pki.PKIError, match="approval"):
+            pki.replace_ca_approved(False)
+        f = tmp_path / "ca.pem"
+        f.write_text("x")
+        old = str(tmp_path / "aurora-manager-ca.pem")
+        f.rename(old)
+        pki.replace_ca_approved(True, ca_cert=old, ca_key=str(tmp_path / "k"))
+        assert not os.path.exists(old)  # renamed to .replaced-<ts>
+
+
+class TestDownloadEndpoint:
+    def _login(self, client):
+        client.post("/login", data={"username": "admin",
+                                    "password": "TestPass123",
+                                    "csrf": session_csrf(client)})
+        return session_csrf(client)
+
+    def test_download_standard_filename(self, client, monkeypatch, tmp_path):
+        self._login(client)
+        ca = tmp_path / "aurora-manager-ca.pem"
+        ca.write_text("-----BEGIN CERTIFICATE-----\nabc\n"
+                      "-----END CERTIFICATE-----\n")
+        monkeypatch.setattr(pki, "CA_CERT", str(ca))
+        r = client.get("/ca.pem")
+        assert r.status_code == 200
+        cd = r.headers["Content-Disposition"]
+        assert "aurora-manager-ca.pem" in cd
+        assert r.data == ca.read_bytes()  # EXACT public CA bytes
+
+    def test_download_missing_cert_clear_error(self, client, monkeypatch, tmp_path):
+        self._login(client)
+        monkeypatch.setattr(pki, "CA_CERT", str(tmp_path / "nope.pem"))
+        r = client.get("/ca.pem")
+        assert r.status_code == 404
+        assert b"not found" in r.data
+
+    def test_download_invalid_pem_rejected(self, client, monkeypatch, tmp_path):
+        self._login(client)
+        ca = tmp_path / "aurora-manager-ca.pem"
+        ca.write_text("not a certificate")
+        monkeypatch.setattr(pki, "CA_CERT", str(ca))
+        r = client.get("/ca.pem")
+        assert r.status_code == 500
+
+    def test_download_requires_auth(self, client):
+        r = client.get("/ca.pem")
+        assert r.status_code == 302  # redirect to login
+
+    def test_no_path_traversal_possible(self, client, monkeypatch):
+        # endpoint ignores any form of user input entirely
+        self._login(client)
+        r = client.get("/ca.pem?path=/etc/shadow&file=../../../../etc/shadow")
+        assert b"root:" not in r.data
+
+    def test_private_keys_never_served(self, client, monkeypatch, tmp_path):
+        # even if someone points CA_CERT at a private key, the PEM check rejects
+        self._login(client)
+        key = tmp_path / "aurora-manager-ca.pem"
+        key.write_text("-----BEGIN PRIVATE KEY-----\nabc\n"
+                       "-----END PRIVATE KEY-----\n")
+        monkeypatch.setattr(pki, "CA_CERT", str(key))
+        r = client.get("/ca.pem")
+        assert r.status_code == 500
+
+
+class TestInstallerStandardNames:
+    def _inst(self):
+        return open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "install.sh")).read()
+
+    def test_standard_ca_filename(self):
+        text = self._inst()
+        assert "aurora-manager-ca.pem" in text
+        assert "aurora-manager-ca-key.pem" in text
+        assert "aurora-server-key.pem" in text
+        assert "aurora-server-cert.pem" in text
+        assert 'leftcert=aurora-server-cert.pem' in text
+        assert "ca-cert.pem" not in text.replace("aurora-manager-ca.pem", "")
+
+    def test_cert_validation_steps(self):
+        text = self._inst()
+        assert "validate_certs" in text
+        assert "openssl verify -CAfile" in text
+        assert "-checkend" in text
+        assert "-modulus" in text
+
+    def test_ca_replace_needs_explicit_approval(self):
+        text = self._inst()
+        assert "REPLACE-CA" in text
+
+    def test_fresh_conflict_detection(self):
+        text = self._inst()
+        assert "non-Aurora configuration" in text
+        assert "swanctl config detected" in text
+
+    def test_bash_syntax(self):
+        p = subprocess.run(["bash", "-n", os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "install.sh")], capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
