@@ -1,6 +1,6 @@
 # Aurora IKEv2 Manager
 
-![license](https://img.shields.io/badge/license-MIT-blue) ![platform](https://img.shields.io/badge/platform-Ubuntu%2020.04%2B-orange) ![tests](https://img.shields.io/badge/tests-76%20unit%20%2B%2015%20E2E-brightgreen)
+![license](https://img.shields.io/badge/license-MIT-blue) ![platform](https://img.shields.io/badge/platform-Ubuntu%2020.04%2B-orange) ![tests](https://img.shields.io/badge/tests-81%20unit%20%2B%2017%20E2E-brightgreen)
 
 > **Scope:** user management is supported for **classic `ipsec.conf` /
 > `ipsec.secrets`** installs and for **swanctl/VICI** installs with
@@ -100,10 +100,12 @@ typing `REPLACE-CA` at a confirmation prompt. The downloaded CA is the exact
 file strongSwan loads; it is the public certificate only and is identical
 for every user of the server.
 
-**Not tested:** the official strongSwan Android app has NOT been verified
-against a real connection to an Aurora-installed server (no live server test
-was performed). Certificate/SAN format follows the app's documented
-requirements (SAN matching the server address, serverAuth flag, IKEv2 EAP).
+**Not tested (honest scope):** neither the official strongSwan Android app
+connection NOR a full clean-server installation (systemd, apt, live charon,
+firewall) has been verified — the E2E test is a sandbox exercising the real
+production PKI/secrets/dashboard code paths, and its header states these
+limits. Certificate/SAN format follows the app's documented requirements
+(SAN matching the server address, serverAuth flag, IKEv2 EAP).
 
 ## Test results
 

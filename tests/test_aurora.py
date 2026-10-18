@@ -615,7 +615,11 @@ class TestRealPKI:
         f.write_text("x")
         old = str(tmp_path / "aurora-manager-ca.pem")
         f.rename(old)
-        pki.replace_ca_approved(True, ca_cert=old, ca_key=str(tmp_path / "k"))
+        (tmp_path / "sk").write_text("s")
+        (tmp_path / "sc").write_text("s")
+        pki.replace_ca_approved(True, ca_cert=old, ca_key=str(tmp_path / "k"),
+                                server_key=str(tmp_path / "sk"),
+                                server_cert=str(tmp_path / "sc"))
         assert not os.path.exists(old)  # renamed to .replaced-<ts>
 
 
@@ -626,11 +630,17 @@ class TestDownloadEndpoint:
                                     "csrf": session_csrf(client)})
         return session_csrf(client)
 
+    def _real_ca(self, tmp_path):
+        """Generate a REAL CA via the production module (strongswan-pki)."""
+        if not shutil.which("/usr/sbin/ipsec"):
+            pytest.skip("strongswan-pki not installed")
+        ca = tmp_path / "aurora-manager-ca.pem"
+        pki.generate_ca(str(tmp_path / "aurora-manager-ca-key.pem"), str(ca))
+        return ca
+
     def test_download_standard_filename(self, client, monkeypatch, tmp_path):
         self._login(client)
-        ca = tmp_path / "aurora-manager-ca.pem"
-        ca.write_text("-----BEGIN CERTIFICATE-----\nabc\n"
-                      "-----END CERTIFICATE-----\n")
+        ca = self._real_ca(tmp_path)
         monkeypatch.setattr(pki, "CA_CERT", str(ca))
         r = client.get("/ca.pem")
         assert r.status_code == 200
@@ -650,6 +660,7 @@ class TestDownloadEndpoint:
         ca = tmp_path / "aurora-manager-ca.pem"
         ca.write_text("not a certificate")
         monkeypatch.setattr(pki, "CA_CERT", str(ca))
+        # garbage must now fail with a clear error (robust validation)
         r = client.get("/ca.pem")
         assert r.status_code == 500
 
@@ -664,11 +675,17 @@ class TestDownloadEndpoint:
         assert b"root:" not in r.data
 
     def test_private_keys_never_served(self, client, monkeypatch, tmp_path):
-        # even if someone points CA_CERT at a private key, the PEM check rejects
+        # even if someone points CA_CERT at a private key, cert parsing rejects
         self._login(client)
         key = tmp_path / "aurora-manager-ca.pem"
-        key.write_text("-----BEGIN PRIVATE KEY-----\nabc\n"
-                       "-----END PRIVATE KEY-----\n")
+        if shutil.which("/usr/sbin/ipsec"):
+            pki.generate_ca(str(tmp_path / "k.pem"), str(key))  # real CA first
+            # then overwrite with a real private key file
+            subprocess.run(["/usr/sbin/ipsec", "pki", "--gen", "--type", "rsa",
+                            "--size", "2048", "--outform", "pem"],
+                           stdout=open(key, "wb"), check=True)
+        else:
+            key.write_text("garbage")
         monkeypatch.setattr(pki, "CA_CERT", str(key))
         r = client.get("/ca.pem")
         assert r.status_code == 500
@@ -682,30 +699,99 @@ class TestInstallerStandardNames:
     def test_standard_ca_filename(self):
         text = self._inst()
         assert "aurora-manager-ca.pem" in text
-        assert "aurora-manager-ca-key.pem" in text
-        assert "aurora-server-key.pem" in text
-        assert "aurora-server-cert.pem" in text
+        # key filenames live in the authoritative pki module now
         assert 'leftcert=aurora-server-cert.pem' in text
         assert "ca-cert.pem" not in text.replace("aurora-manager-ca.pem", "")
+        from aurora import pki as _p
+        assert "aurora-manager-ca-key.pem" in _p.CA_KEY
+        assert "aurora-server-key.pem" in _p.SERVER_KEY
+        assert "aurora-server-cert.pem" in _p.SERVER_CERT
 
-    def test_cert_validation_steps(self):
+    def test_installer_delegates_to_pki_module(self):
         text = self._inst()
-        assert "validate_certs" in text
-        assert "openssl verify -CAfile" in text
-        assert "-checkend" in text
-        assert "-modulus" in text
+        # single authoritative implementation: installer calls the module,
+        # no inline certificate generation/validation commands remain
+        assert "aurora.pki_cli" in text
+        assert "ipsec pki --gen" not in text
+        assert "ipsec pki --self" not in text
+        assert "ipsec pki --issue" not in text
+        assert "-modulus" not in text
 
     def test_ca_replace_needs_explicit_approval(self):
         text = self._inst()
         assert "REPLACE-CA" in text
 
-    def test_fresh_conflict_detection(self):
+    def test_fresh_conflict_hard_stop(self):
         text = self._inst()
-        assert "non-Aurora configuration" in text
-        assert "swanctl config detected" in text
+        assert "FRESH INSTALL REFUSED" in text
+        assert "--mode existing" in text
+        assert "--mode reinstall" in text
+        assert "Nothing was changed" in text
+        assert "swanctl.conf" in text
+        assert "/etc/ipsec.d" in text
 
     def test_bash_syntax(self):
         p = subprocess.run(["bash", "-n", os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "install.sh")], capture_output=True, text=True)
         assert p.returncode == 0, p.stderr
+
+
+# ------------------------------------------------- v1.4: single PKI authority
+
+class TestPkiAuthority:
+    def _env(self):
+        return {**os.environ, "PYTHONPATH": os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))}
+
+    def test_pki_cli_gen_refuses_existing_ca(self):
+        import subprocess
+        if not os.path.exists("/etc/ipsec.d/cacerts/aurora-manager-ca.pem"):
+            pytest.skip("no CA on this host")
+        r = subprocess.run([sys.executable, "-m", "aurora.pki_cli", "gen-ca"],
+                           capture_output=True, text=True, env=self._env())
+        if os.geteuid() == 0:
+            assert r.returncode == 3 and "ca-exists" in r.stdout
+        else:
+            # unprivileged: refuse before touching anything (exit 2)
+            assert r.returncode == 2 and "root" in r.stderr
+
+    def test_pki_cli_requires_root_for_gen(self):
+        import subprocess
+        if os.geteuid() == 0:
+            pytest.skip("running as root")
+        r = subprocess.run([sys.executable, "-m", "aurora.pki_cli", "gen-ca"],
+                           capture_output=True, text=True, env=self._env())
+        assert r.returncode == 2 and "root" in r.stderr
+
+    def test_replace_ca_needs_explicit_flag(self):
+        import subprocess
+        r = subprocess.run([sys.executable, "-m", "aurora.pki_cli",
+                            "replace-ca"],
+                           capture_output=True, text=True, env=self._env())
+        assert r.returncode == 2
+
+    def test_parse_certificate_rejects_garbage(self, tmp_path):
+        from aurora import pki
+        f = tmp_path / "fake.pem"
+        f.write_text("-----BEGIN CERTIFICATE-----\nnotreally\n"
+                     "-----END CERTIFICATE-----\n")
+        assert pki.parse_certificate(str(f)) == {}
+
+    def test_ca_bytes_requires_real_ca(self, tmp_path):
+        from aurora import pki
+        garbage = tmp_path / "aurora-manager-ca.pem"
+        garbage.write_text("hello world")
+        with pytest.raises(pki.PKIError):
+            pki.ca_bytes(str(garbage))
+        # a real SERVER cert (is_ca=False) must also be refused as CA
+        if os.path.exists(pki.SERVER_CERT):
+            import pytest as _p
+            from aurora import pki as _pki
+            saved = pki.CA_CERT
+            try:
+                _pki.CA_CERT = pki.SERVER_CERT
+                with _p.raises(pki.PKIError, match="not a valid"):
+                    _pki.ca_bytes()
+            finally:
+                _pki.CA_CERT = saved

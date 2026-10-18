@@ -356,9 +356,9 @@ def create_app() -> Flask:
         except OSError:
             abort(404, "CA certificate not found on this server — "
                        "expected at " + pki.CA_CERT)
-        if b"BEGIN CERTIFICATE" not in data:
-            abort(500, "CA file at " + pki.CA_CERT +
-                       " is not a valid PEM certificate")
+        except pki.PKIError as e:
+            # file exists but is not a valid, unexpired CA certificate
+            abort(500, "CA file at " + pki.CA_CERT + " is invalid: " + str(e))
         import io
         return send_file(io.BytesIO(data),
                          mimetype="application/x-pem-file",

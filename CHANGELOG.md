@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.4.0 — 2026-10-18 (single PKI authority + honest E2E)
+- Single authoritative PKI implementation: install.sh delegates all
+  certificate generation/validation to aurora/pki.py via the new
+  aurora/pki_cli.py root CLI (gen-ca / gen-server / replace-ca --approved /
+  validate). No certificate commands remain in the installer.
+- E2E test rewritten to exercise the REAL production module and pki_cli
+  (4096-bit CA, exact typed SAN validation, md5-verified download bytes,
+  dashboard endpoint) — clearly labeled as sandbox scope: no systemd VM,
+  no live charon, no firewall. Full clean-server install NOT claimed tested.
+- Fresh install HARD-STOP on existing strongSwan config (ipsec.conf content,
+  swanctl.conf, existing certs) with pointer to --mode existing / reinstall.
+  Nothing is changed on conflict.
+- Exact client-facing identity validation: typed SAN parsing (DNS/IP v4/v6,
+  canonicalized), openssl-based cert parsing (subject, SAN, basicConstraints,
+  expiry) — broad text search removed. conn block leftid == cert identity.
+- /ca.pem robustness: real CA-certificate parse (basicConstraints CA:TRUE,
+  unexpired) instead of PEM-header sniff; 404 missing / 500 invalid; path
+  traversal impossible (fixed path).
+- 81 unit/integration tests + 17-check E2E; CI green including E2E.
+
 ## 1.3.0 — 2026-10-18 (automation + standard CA naming)
 - Standard CA filename `aurora-manager-ca.pem` across installer, storage,
   dashboard download, setup instructions and docs; legacy /ca.crt kept as an
