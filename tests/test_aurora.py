@@ -369,3 +369,163 @@ class TestInstallerHelpers:
             os.path.abspath(__file__))), "install.sh")
         text = open(path).read()
         assert "PRESERVED" in text  # admin access kept on reinstall
+
+
+# ---------------------------------------------- swanctl user management (v1.2)
+
+from aurora import swanctl_users
+
+
+class TestSwanctlUserManagement:
+    """Isolated environment: temp secrets files, mocked reloads."""
+
+    @pytest.fixture(autouse=True)
+    def swan_env(self, tmp_path, monkeypatch):
+        self.secrets = tmp_path / "swanctl" / "secrets" / "aurora.secrets"
+        self.secrets.parent.mkdir(parents=True)
+        self.bak = tmp_path / "backups"
+        monkeypatch.setenv("AURORA_BACKUP_DIR", str(self.bak))
+        monkeypatch.setenv("AURORA_SWANCTL_SECRETS", str(self.secrets))
+        monkeypatch.setattr(swanctl_users, "load_secrets", lambda: None)
+        # seed an existing deployment with an unrelated user
+        self.secrets.write_text(
+            '"existing-user" : EAP "ExistingPw99"\n')
+        yield
+
+    def test_add_user(self):
+        swanctl_users.add_user("alice", "S3curePass!x", path=str(self.secrets))
+        users = swanctl_users.list_users(str(self.secrets))
+        assert users == ["existing-user", "alice"]
+
+    def test_add_duplicate_rejected(self):
+        swanctl_users.add_user("alice", "S3curePass!x", path=str(self.secrets))
+        with pytest.raises(ValueError):
+            swanctl_users.add_user("alice", "OtherPass11", path=str(self.secrets))
+
+    def test_delete_only_target_user(self):
+        swanctl_users.add_user("alice", "S3curePass!x", path=str(self.secrets))
+        swanctl_users.add_user("bob", "BobsPass1234", path=str(self.secrets))
+        assert swanctl_users.delete_user("alice", path=str(self.secrets)) is True
+        assert swanctl_users.list_users(str(self.secrets)) == ["existing-user", "bob"]
+        # unrelated users' entries byte-identical in intent:
+        text = self.secrets.read_text()
+        assert '"existing-user" : EAP "ExistingPw99"' in text
+        assert "alice" not in text
+
+    def test_delete_missing_returns_false(self):
+        assert swanctl_users.delete_user("ghost", path=str(self.secrets)) is False
+
+    def test_password_change(self):
+        swanctl_users.add_user("alice", "S3curePass!x", path=str(self.secrets))
+        swanctl_users.set_user_password("alice", "NewPass99xyz", path=str(self.secrets))
+        assert "NewPass99xyz" in self.secrets.read_text()
+        assert "S3curePass" not in self.secrets.read_text()
+        with pytest.raises(ValueError):
+            swanctl_users.set_user_password("ghost", "Whatever123",
+                                            path=str(self.secrets))
+
+    def test_disable_revoke_enable(self):
+        swanctl_users.add_user("alice", "S3curePass!x", path=str(self.secrets))
+        assert swanctl_users.disable_user("alice", path=str(self.secrets)) is True
+        assert swanctl_users.user_state("alice", str(self.secrets)) == "disabled"
+        # disabled line still contains the (commented) secret format but is a comment
+        assert "# disabled by aurora:" in self.secrets.read_text()
+        assert swanctl_users.enable_user("alice", path=str(self.secrets)) is True
+        assert swanctl_users.user_state("alice", str(self.secrets)) == "enabled"
+
+    def test_validation(self):
+        for bad in ("", "a", "bad name", "x" * 65, "u; rm -rf /"):
+            with pytest.raises(ValueError):
+                swanctl_users.add_user(bad, "S3curePass!x", path=str(self.secrets))
+        for badpw in ("short", "پسورد", "", "x" * 129):
+            with pytest.raises(ValueError):
+                swanctl_users.add_user("valid1", badpw, path=str(self.secrets))
+
+    def test_backup_created_before_mutation(self):
+        swanctl_users.add_user("alice", "S3curePass!x", path=str(self.secrets))
+        baks = list(self.bak.glob("aurora.secrets.*.bak"))
+        assert len(baks) >= 1
+        assert "ExistingPw99" in baks[0].read_text()  # pre-mutation state
+
+    def test_file_permissions_0600(self):
+        swanctl_users.add_user("alice", "S3curePass!x", path=str(self.secrets))
+        assert (self.secrets.stat().st_mode & 0o777) == 0o600
+
+    def test_reload_failure_restores_backup(self, monkeypatch):
+        calls = {"n": 0}
+        def failing_reload():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise swanctl_users.CommandError("vici socket unavailable")
+            return None  # recovery reload succeeds
+        monkeypatch.setattr(swanctl_users, "load_secrets", failing_reload)
+        with pytest.raises(swanctl_users.CommandError):
+            swanctl_users.add_user("alice", "S3curePass!x", path=str(self.secrets))
+        # state on disk restored: only the original user, no alice
+        assert "alice" not in self.secrets.read_text()
+        assert "ExistingPw99" in self.secrets.read_text()
+
+    def test_eap_configured_check(self, tmp_path):
+        conf = tmp_path / "swanctl.conf"
+        conf.write_text('connections { vpn { remote-1 { auth = eap-mschapv2; } } }\n')
+        ok, _ = swanctl_users.check_eap_configured(str(conf))
+        assert ok is True
+        conf.write_text('connections { vpn { remote-1 { auth = pubkey; } } }\n')
+        ok, detail = swanctl_users.check_eap_configured(str(conf))
+        assert ok is False and "does not edit swanctl.conf" in detail
+        ok, _ = swanctl_users.check_eap_configured(str(tmp_path / "missing"))
+        assert ok is False
+
+    def test_privilege_whitelist_includes_swanctl(self):
+        assert privileged.is_whitelisted(["/usr/sbin/swanctl", "--load-secrets"])
+
+    def test_find_secrets_file_prefers_existing(self, tmp_path):
+        d = tmp_path / "secrets"
+        d.mkdir()
+        (d / "other.secrets").write_text('"x" : EAP "pw12345678"\n')
+        assert swanctl_users.find_secrets_file(str(d)) == str(d / "other.secrets")
+        (d / "aurora.secrets").write_text("")
+        assert swanctl_users.find_secrets_file(str(d)) == str(d / "aurora.secrets")
+
+
+class TestSwanctlWebIntegration:
+    def test_users_page_lists_swanctl_users(self, client, monkeypatch):
+        import re
+        r = client.get("/login")
+        csrf = re.search(r'name="csrf" value="([0-9a-f]+)"', r.get_data(as_text=True)).group(1)
+        client.post("/login", data={"username": "admin", "password": "TestPass123", "csrf": csrf})
+        monkeypatch.setattr(strongswan, "stack_layout", lambda: "swanctl")
+        r = client.get("/users")
+        assert r.status_code == 200
+
+    def test_swanctl_add_via_dashboard(self, client, monkeypatch, tmp_path):
+        import tempfile
+        monkeypatch.setenv("AURORA_BACKUP_DIR",
+                           tempfile.mkdtemp(prefix="aurora-swtest-"))
+        client.post("/login", data={"username": "admin", "password": "TestPass123",
+                                    "csrf": session_csrf(client)})
+        csrf = session_csrf(client)
+        monkeypatch.setattr(strongswan, "stack_layout", lambda: "swanctl")
+        f = tmp_path / "s.secrets"
+        f.write_text("")
+        monkeypatch.setattr(swanctl_users, "find_secrets_file", lambda: str(f))
+        monkeypatch.setattr(swanctl_users, "load_secrets", lambda: None)
+        monkeypatch.setattr(swanctl_users, "check_eap_configured",
+                            lambda: (True, "ok"))
+        r = client.post("/users", data={
+            "action": "add", "username": "dashuser", "password": "DashPass123",
+            "csrf": csrf})
+        assert r.status_code == 302
+        assert "dashuser" in f.read_text()
+
+    def test_swanctl_add_refused_without_eap_conf(self, client, monkeypatch, tmp_path):
+        client.post("/login", data={"username": "admin", "password": "TestPass123",
+                                    "csrf": session_csrf(client)})
+        csrf = session_csrf(client)
+        monkeypatch.setattr(strongswan, "stack_layout", lambda: "swanctl")
+        monkeypatch.setattr(swanctl_users, "check_eap_configured",
+                            lambda: (False, "no EAP auth round found"))
+        r = client.post("/users", data={
+            "action": "add", "username": "nouser", "password": "NoPass1234",
+            "csrf": csrf})
+        assert r.status_code == 302  # redirected with flash, nothing written

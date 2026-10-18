@@ -11,6 +11,8 @@ Whitelisted elevated commands (see install.sh sudoers block):
     /usr/sbin/ipsec restart
     /usr/sbin/ipsec statusall
     /usr/bin/systemctl restart strongswan-starter
+    /usr/sbin/swanctl --load-secrets
+    /usr/bin/systemctl restart strongswan-starter
     /usr/bin/systemctl reload strongswan-starter
 """
 from __future__ import annotations
@@ -25,6 +27,7 @@ SUDO_WHITELIST: list[list[str]] = [
     ["/usr/sbin/ipsec", "update"],
     ["/usr/sbin/ipsec", "restart"],
     ["/usr/sbin/ipsec", "statusall"],
+    ["/usr/sbin/swanctl", "--load-secrets"],
     ["/usr/bin/systemctl", "restart", "strongswan-starter"],
     ["/usr/bin/systemctl", "reload", "strongswan-starter"],
 ]

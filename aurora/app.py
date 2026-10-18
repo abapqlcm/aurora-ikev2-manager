@@ -22,7 +22,8 @@ from flask import (Flask, abort, flash, g, redirect, render_template, request,
                    session, url_for, send_file, Response)
 
 from . import strongswan, monitor
-from .environment import detect_environment, inspect_existing
+from . import swanctl_users
+from .environment import detect_environment, inspect_existing, CommandError
 
 def _db_path() -> str:
     return os.environ.get("AURORA_DB", "/var/lib/aurora-ikev2/aurora.db")
@@ -127,6 +128,52 @@ def check_csrf() -> None:
         abort(400, "CSRF validation failed")
 
 
+def _swanctl_user_action(action, username, request, audit, flash):
+    """Dispatch user mutations to the swanctl backend (same restrictions
+    enforced server-side as in the UI)."""
+    ok, detail = swanctl_users.check_eap_configured()
+    if not ok:
+        flash(f"swanctl server: {detail}", "error")
+        return
+    path = swanctl_users.find_secrets_file()
+    try:
+        if action == "add":
+            swanctl_users.add_user(username, request.form.get("password", ""), path=path)
+            audit("swanctl_user_add", username)
+            flash(f"User {username} created (secrets reloaded).", "ok")
+        elif action == "delete":
+            if request.form.get("confirm", "") != username:
+                raise ValueError("type the username to confirm deletion")
+            if swanctl_users.delete_user(username, path=path):
+                audit("swanctl_user_delete", username)
+                flash(f"User {username} deleted.", "ok")
+            else:
+                flash(f"User {username} not found.", "error")
+        elif action == "disable":
+            if swanctl_users.disable_user(username, path=path):
+                audit("swanctl_user_disable", username)
+                flash(f"User {username} disabled (revoked at next "
+                      "authentication; existing sessions persist).", "ok")
+            else:
+                flash(f"User {username} not found.", "error")
+        elif action == "enable":
+            if swanctl_users.enable_user(username, path=path):
+                audit("swanctl_user_enable", username)
+                flash(f"User {username} enabled.", "ok")
+            else:
+                flash(f"User {username} not found.", "error")
+        elif action == "passwd":
+            swanctl_users.set_user_password(username,
+                                            request.form.get("password", ""),
+                                            path=path)
+            audit("swanctl_user_passwd", username)
+            flash(f"Password changed for {username}.", "ok")
+        else:
+            raise ValueError("unknown action")
+    except (ValueError, CommandError) as e:
+        flash(f"swanctl error: {e}", "error")
+
+
 # ------------------------------------------------------------------- app factory
 
 def create_app() -> Flask:
@@ -209,11 +256,10 @@ def create_app() -> Flask:
             check_csrf()
             action = request.form.get("action", "")
             username = request.form.get("username", "").strip()
-            if strongswan.stack_layout() == "swanctl":
-                flash("This server uses swanctl — Aurora user management is "
-                      "disabled (read-only panel).", "error")
-                return redirect(url_for("users"))
             try:
+                if strongswan.stack_layout() == "swanctl":
+                    _swanctl_user_action(action, username, request, audit, flash)
+                    return redirect(url_for("users"))
                 if action == "add":
                     strongswan.add_user(username, request.form.get("password", ""))
                     strongswan.reload_secrets()
@@ -248,7 +294,13 @@ def create_app() -> Flask:
                 flash(str(e), "error")
             return redirect(url_for("users"))
         q = request.args.get("q", "").lower()
-        all_users = [(u, strongswan.user_state(u)) for u in strongswan.list_users()]
+        if strongswan.stack_layout() == "swanctl":
+            path = swanctl_users.find_secrets_file()
+            all_users = [(u, "disabled" if d else "enabled")
+                         for u, d in swanctl_users.parse_entries(
+                             swanctl_users._read(path))]
+        else:
+            all_users = [(u, strongswan.user_state(u)) for u in strongswan.list_users()]
         if q:
             all_users = [(u, s) for u, s in all_users if q in u.lower()]
         return render_template("users.html", users=all_users, q=q)

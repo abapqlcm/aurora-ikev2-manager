@@ -2,10 +2,11 @@
 
 ![license](https://img.shields.io/badge/license-MIT-blue) ![platform](https://img.shields.io/badge/platform-Ubuntu%2020.04%2B-orange) ![tests](https://img.shields.io/badge/tests-42%20passing-brightgreen)
 
-> **Scope (MVP):** full user management is supported on **classic `ipsec.conf` /
-> `ipsec.secrets`** strongSwan installs only. swanctl/VICI installs are detected
-> and the panel is installed **read-only** (monitoring + diagnostics, user
-> management disabled) — existing swanctl config is never touched.
+> **Scope:** user management is supported for **classic `ipsec.conf` /
+> `ipsec.secrets`** installs and for **swanctl/VICI** installs with
+> EAP-MSCHAPv2 (via the swanctl secrets directory + `swanctl --load-secrets`,
+> no daemon restart). swanctl.conf itself is never edited; see
+> docs/migration.md for preconditions and limitations.
 > This project should be considered **beta**, not production-ready: the VPN
 > datapath itself has not been verified end-to-end on a live server.
 

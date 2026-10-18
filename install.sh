@@ -284,6 +284,7 @@ cat > /etc/sudoers.d/aurora-panel <<EOF
 $AURORA_USER ALL=(root) NOPASSWD: /usr/sbin/ipsec rereadsecrets, \\
     /usr/sbin/ipsec update, \\
     /usr/sbin/ipsec statusall, \\
+    /usr/sbin/swanctl --load-secrets, \\
     /usr/bin/systemctl restart strongswan-starter, \\
     /usr/bin/systemctl reload strongswan-starter
 EOF
