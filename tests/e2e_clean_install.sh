@@ -107,7 +107,7 @@ else ok "no private keys in panel data dir"; fi
   && ok "pre-mutation backups created" || bad "no backups"
 
 # --- 7. config validation: aurora conn block renders and parses ---
-"$REPO/venv/bin/python" -c "
+"$PY" -c "
 import sys; sys.path.insert(0, '$REPO')
 from aurora import strongswan
 c = strongswan.render_conn('$IP')
