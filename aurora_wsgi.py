@@ -1,5 +1,4 @@
 """WSGI entry point for the Aurora panel."""
-import os
 from aurora.app import create_app
 
 app = create_app()

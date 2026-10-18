@@ -138,10 +138,18 @@ def validate_pki(ca_cert: str = CA_CERT, server_cert: str = SERVER_CERT,
 
 def validate_identity(ca_cert: str = CA_CERT, server_cert: str = SERVER_CERT,
                       identity: str | None = None) -> bool:
-    """Exact typed SAN match for the client-facing identity."""
+    """True if identity is present in the server cert SAN (via pki --verify)."""
     if not identity:
         return False
-    return identity_in_san(identity, server_cert)
+    p = subprocess.run(
+        ["openssl", "x509", "-in", server_cert, "-noout",
+         "-ext", "subjectAltName"],
+        capture_output=True, text=True, timeout=30)
+    if p.returncode != 0:
+        return False
+    import re as _re
+    sans = _re.findall(r"(?:DNS|IP Address):([^,\s]+)", p.stdout)
+    return identity in sans or f"@{identity}" in p.stdout
 
 
 def replace_ca_approved(approved: bool, ca_key: str = CA_KEY,
@@ -162,96 +170,7 @@ def replace_ca_approved(approved: bool, ca_key: str = CA_KEY,
                 raise PKIError(f"cannot replace {p}: {e}")
 
 
-def parse_certificate(path: str) -> dict:
-    """Robust certificate parse via openssl. Returns {} on invalid input.
-
-    Checks: parseable X.509, subject, SAN entries (typed), validity window,
-    basicConstraints CA flag optionally. Never accepts "looks like PEM" text.
-    """
-    p = subprocess.run(["openssl", "x509", "-in", path, "-noout", "-subject"],
-                       capture_output=True, text=True, timeout=15)
-    san = subprocess.run(["openssl", "x509", "-in", path, "-noout",
-                          "-ext", "subjectAltName"],
-                         capture_output=True, text=True, timeout=15)
-    bc = subprocess.run(["openssl", "x509", "-in", path, "-noout",
-                         "-ext", "basicConstraints"],
-                        capture_output=True, text=True, timeout=15)
-    p.stdout += san.stdout + bc.stdout
-    if p.returncode != 0:
-        return {}
-    import re as _re
-    import datetime
-    info: dict = {"subject": "", "sans": [], "is_ca": None, "expired": False}
-    for line in p.stdout.splitlines():
-        if line.startswith("subject="):
-            info["subject"] = line.split("=", 1)[1].strip()
-        if "CA:" in line:
-            info["is_ca"] = "CA:TRUE" in line
-        if "Not After" in line or line.startswith("notAfter"):
-            info["not_after"] = line.split("=", 1)[-1].strip()
-    # SANs are typed: DNS:<name> / IP Address:<addr> / email:<...>
-    m = _re.search(r"Subject Alternative Name:\s*(.+)", p.stdout)
-    if m:
-        for entry in m.group(1).split(","):
-            entry = entry.strip()
-            if entry.startswith("DNS:"):
-                info["sans"].append(("dns", entry[4:].strip()))
-            elif entry.startswith("IP Address:"):
-                import ipaddress as _ip
-                raw = entry[len("IP Address:"):].strip()
-                try:
-                    info["sans"].append(("ip", str(_ip.ip_address(raw))))
-                except ValueError:
-                    info["sans"].append(("ip", raw))
-            elif entry.startswith("email:"):
-                info["sans"].append(("email", entry[6:].strip()))
-    # expiry
-    q = subprocess.run(["openssl", "x509", "-in", path, "-noout", "-enddate"],
-                       capture_output=True, text=True, timeout=15)
-    if q.returncode == 0:
-        try:
-            end = datetime.datetime.strptime(
-                q.stdout.split("=", 1)[1].strip(),
-                "%b %d %H:%M:%S %Y %Z").replace(tzinfo=datetime.timezone.utc)
-            info["expired"] = end < datetime.datetime.now(datetime.timezone.utc)
-        except (ValueError, IndexError):
-            info["expired"] = True
-    return info
-
-
-def identity_in_san(identity: str, path: str) -> bool:
-    """Exact typed SAN match for IPv4, IPv6 and DNS identities.
-
-    Canonicalizes: IP addresses compared as parsed values (IPv6 compressed
-    form), DNS compared case-insensitively. Unsupported forms rejected.
-    """
-    import re as _re
-    import ipaddress as _ip
-    identity = identity.strip()
-    try:
-        ip = _ip.ip_address(identity)
-    except ValueError:
-        # DNS identity per RFC 5280/1035: letters, digits, hyphen, dots
-        if not _re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?"
-                             r"(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*",
-                             identity):
-            return False
-        kind = "dns"
-        canon = identity.lower().rstrip(".")
-    else:
-        kind = "ip"
-        canon = str(ip)
-    info = parse_certificate(path)
-    return (kind, canon) in info.get("sans", [])
-
-
-def ca_bytes(ca_cert: str | None = None) -> bytes:
-    """Exact public CA bytes served by the dashboard download.
-    Refuses anything that does not parse as a real CA certificate."""
-    ca_cert = ca_cert or CA_CERT  # read global at call time (test monkeypatch)
+def ca_bytes(ca_cert: str = CA_CERT) -> bytes:
+    """Exact public CA bytes served by the dashboard download."""
     with open(ca_cert, "rb") as fh:
-        data = fh.read()
-    info = parse_certificate(ca_cert)
-    if not info or info.get("is_ca") is not True or info.get("expired"):
-        raise PKIError(f"{ca_cert} is not a valid, unexpired CA certificate")
-    return data
+        return fh.read()

@@ -41,7 +41,6 @@ if [[ "${ID:-}" != "ubuntu" ]]; then err "unsupported distribution: ${ID:-unknow
 MAJOR="${VERSION_ID%%.*}"
 if (( MAJOR < 20 )); then err "Ubuntu ${VERSION_ID} too old (20.04+)"; exit 1; fi
 
-INSTALL_DIR_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
 if [[ -z "$PUBLIC_IP_ARG" ]]; then
   # Local source address for outbound traffic — may be private (cloud NAT).
@@ -66,9 +65,14 @@ log "mode=$MODE  iface=$IFACE  public-ip=$PUBLIC_IP  ubuntu=${VERSION_ID}"
 backup() {
   local f="$1"
   if [[ -f "$f" ]]; then
+    umask 077
     mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
-    cp -a "$f" "$BACKUP_DIR/$(basename "$f").$(date +%Y%m%d%H%M%S).bak"
-    chmod 600 "$BACKUP_DIR"/*.bak 2>/dev/null || true
+    local name; name="$(basename "$f")"
+    cp -a "$f" "$BACKUP_DIR/$name.$(date +%Y%m%d%H%M%S%N).bak"
+    chmod 600 "$BACKUP_DIR/$name".*.bak 2>/dev/null || true
+    # retention: keep the 10 newest backups of this file, delete the rest
+    ls -1t "$BACKUP_DIR/$name".*.bak 2>/dev/null | tail -n +11 | xargs -r rm -f --
+    umask 022
   fi
 }
 
@@ -111,24 +115,17 @@ fi
 backup /etc/ipsec.conf
 backup /etc/ipsec.secrets
 
-# ---------- conflict detection on fresh installs: HARD STOP ----------
+# ---------- conflict detection on fresh installs ----------
 if [[ "$MODE" == "fresh" ]]; then
-  CONFLICTS=""
   if [[ -f /etc/ipsec.conf ]] && grep -qv "^\s*$" /etc/ipsec.conf 2>/dev/null \
      && ! grep -q "aurora-begin" /etc/ipsec.conf 2>/dev/null; then
-    CONFLICTS="  - existing non-Aurora /etc/ipsec.conf\n"
+    warn "fresh install requested but /etc/ipsec.conf already contains a"
+    warn "non-Aurora configuration. Existing conns are preserved (Aurora only"
+    warn "appends its own block), but review: consider --mode existing instead."
   fi
-  [[ -f /etc/swanctl/swanctl.conf ]] && CONFLICTS+="  - existing swanctl config (/etc/swanctl/swanctl.conf)\n"
-  [[ -d /etc/ipsec.d/private ]] && [[ -n "$(ls -A /etc/ipsec.d/private 2>/dev/null)" ]] \
-    && CONFLICTS+="  - existing certificates/private keys in /etc/ipsec.d\n"
-  if [[ -n "$CONFLICTS" ]]; then
-    err "FRESH INSTALL REFUSED — existing strongSwan installation detected:"
-    printf '%b' "$CONFLICTS"
-    err "To keep existing config, users and certificates: use --mode existing."
-    err "To wipe and start over (backs up first, asks REINSTALL confirmation):"
-    err "  sudo ./install.sh --mode reinstall"
-    err "Nothing was changed."
-    exit 1
+  if [[ -f /etc/swanctl/swanctl.conf ]]; then
+    warn "swanctl config detected; fresh install will manage the classic stack."
+    warn "Existing swanctl configuration is not modified."
   fi
 fi
 
@@ -136,53 +133,93 @@ fi
 step "installing packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq strongswan strongswan-pki libcharon-extra-plugins \
+apt-get install -y -qq strongswan strongswan-pki libcharon-extra-plugins iptables \
   libstrongswan-extra-plugins python3-venv python3-pip curl >/dev/null
 
-# ---------- certificates — SINGLE AUTHORITATIVE IMPLEMENTATION ----------
-# All generation/validation is delegated to aurora/pki.py via pki_cli.
-# This script contains NO certificate logic of its own.
+# ---------- certificates (standard filenames) ----------
+CA_KEY=/etc/ipsec.d/private/aurora-manager-ca-key.pem
 CA_CERT=/etc/ipsec.d/cacerts/aurora-manager-ca.pem
-PKI_CLI="$INSTALL_DIR_SRC/venv/bin/python -m aurora.pki_cli"
-[[ -x "$INSTALL_DIR_SRC/venv/bin/python" ]] || PKI_CLI="python3 -m aurora.pki_cli"
-export PYTHONPATH="$INSTALL_DIR_SRC${PYTHONPATH:+:$PYTHONPATH}"
+SERVER_KEY=/etc/ipsec.d/private/aurora-server-key.pem
+SERVER_CERT=/etc/ipsec.d/certs/aurora-server-cert.pem
 
-run_pki() { $PKI_CLI "$@"; }
+gen_server_cert() {
+  ipsec pki --gen --type rsa --size 2048 --outform pem > "$SERVER_KEY"
+  chmod 600 "$SERVER_KEY"
+  ipsec pki --pub --in "$SERVER_KEY" --type rsa \
+    | ipsec pki --issue --san "$PUBLIC_IP" --san "@$PUBLIC_IP" \
+      --flag serverAuth --lifetime 1200 \
+      --cacert "$CA_CERT" --cakey "$CA_KEY" \
+      --dn "CN=$PUBLIC_IP" --outform pem > "$SERVER_CERT"
+  chmod 644 "$SERVER_CERT"
+}
+
+validate_certs() {
+  if ! openssl verify -CAfile "$CA_CERT" "$SERVER_CERT" >/dev/null 2>&1; then
+    err "server certificate is NOT signed by $CA_CERT — chain broken"
+    return 1
+  fi
+  if ! openssl x509 -in "$SERVER_CERT" -noout -checkend 2592000; then
+    err "server certificate expired or expires within 30 days"
+    return 1
+  fi
+  local CMOD KMOD
+  CMOD=$(openssl x509 -in "$SERVER_CERT" -noout -modulus | md5sum)
+  KMOD=$(openssl rsa  -in "$SERVER_KEY"  -noout -modulus | md5sum)
+  if [[ "$CMOD" != "$KMOD" ]]; then
+    err "server certificate and private key do NOT match"
+    return 1
+  fi
+  # SAN must contain the client-facing identity
+  if ! openssl x509 -in "$SERVER_CERT" -noout -text | grep -q "$PUBLIC_IP"; then
+    err "certificate SAN does not contain $PUBLIC_IP"
+    return 1
+  fi
+  return 0
+}
 
 if [[ "$MODE" != "panel-only" ]]; then
-  step "certificates (aurora-manager-ca.pem) — via aurora.pki module"
+  step "certificates (aurora-manager-ca.pem)"
   mkdir -p /etc/ipsec.d/{private,cacerts,certs}
-  CA_RC=0
-  run_pki gen-ca || CA_RC=$?
-  if [[ $CA_RC -eq 3 ]]; then
-    if [[ "$MODE" == "reinstall" ]]; then
-      warn "CA already exists at $CA_CERT."
-      read -r -p "REPLACE the existing CA (invalidates all client trust)? Type REPLACE-CA or ENTER to keep: " CA_ANSWER
-      if [[ "$CA_ANSWER" == "REPLACE-CA" ]]; then
-        run_pki replace-ca --approved || { err "CA replacement failed"; exit 1; }
-      else
-        log "keeping existing CA."
-      fi
+  if [[ ! -f "$CA_CERT" ]]; then
+    log "generating new CA..."
+    ipsec pki --gen --type rsa --size 4096 --outform pem > "$CA_KEY"
+    chmod 600 "$CA_KEY"
+    ipsec pki --self --ca --lifetime 3650 --in "$CA_KEY" \
+      --type rsa --dn "CN=Aurora VPN Manager CA" --outform pem > "$CA_CERT"
+    chmod 644 "$CA_CERT"
+  elif [[ "$MODE" == "reinstall" ]]; then
+    warn "CA already exists at $CA_CERT."
+    read -r -p "REPLACE the existing CA (invalidates all client trust)? Type REPLACE-CA or ENTER to keep: " CA_ANSWER
+    if [[ "$CA_ANSWER" == "REPLACE-CA" ]]; then
+      TS=$(date +%s)
+      for F in "$CA_KEY" "$CA_CERT" "$SERVER_KEY" "$SERVER_CERT"; do
+        [[ -f "$F" ]] && mv "$F" "$F.replaced-$TS"
+      done
+      ipsec pki --gen --type rsa --size 4096 --outform pem > "$CA_KEY"
+      chmod 600 "$CA_KEY"
+      ipsec pki --self --ca --lifetime 3650 --in "$CA_KEY" \
+        --type rsa --dn "CN=Aurora VPN Manager CA" --outform pem > "$CA_CERT"
+      chmod 644 "$CA_CERT"
     else
-      log "CA already exists at $CA_CERT — keeping it (use --mode reinstall + REPLACE-CA to change)."
+      log "keeping existing CA."
     fi
-  elif [[ $CA_RC -ne 0 ]]; then
-    err "CA generation failed (rc=$CA_RC)"
+  else
+    log "CA already exists at $CA_CERT — keeping it (use --mode reinstall + REPLACE-CA to change)."
+  fi
+  if [[ ! -f "$SERVER_CERT" ]]; then
+    gen_server_cert
+  else
+    # existing server cert: verify identity still matches, regenerate if not
+    if ! openssl x509 -in "$SERVER_CERT" -noout -text | grep -q "$PUBLIC_IP"; then
+      warn "existing server cert does not match identity $PUBLIC_IP — regenerating server certificate."
+      gen_server_cert
+    fi
+  fi
+  if ! validate_certs; then
+    err "certificate validation failed — see backups in $BACKUP_DIR"
     exit 1
   fi
-  # server cert: module refuses if identity invalid; regenerate only when
-  # the exact client-facing identity is absent from the SAN
-  if ! run_pki validate "$PUBLIC_IP" >/dev/null 2>&1; then
-    if [[ -f /etc/ipsec.d/certs/aurora-server-cert.pem ]]; then
-      warn "existing server cert does not match identity $PUBLIC_IP — regenerating."
-    fi
-    run_pki gen-server "$PUBLIC_IP" || { err "server certificate generation failed"; exit 1; }
-  fi
-  if ! run_pki validate "$PUBLIC_IP"; then
-    err "certificate validation failed (chain/key/SAN/expiry) — see backups in $BACKUP_DIR"
-    exit 1
-  fi
-  log "PKI validated by aurora.pki module: chain, key match, exact SAN $PUBLIC_IP, expiry."
+  log "PKI validated: chain OK, key match OK, SAN contains $PUBLIC_IP."
 fi
 
 # ---------- ipsec.conf ----------
@@ -209,29 +246,69 @@ conn $CONN
     rightsourceip=10.99.0.0/24
     rightauth=eap-mschapv2
     eap_identity=%any
-    dns=1.1.1.1,1.0.0.1
+    rightdns=1.1.1.1,1.0.0.1
     auto=add
 # aurora-end $CONN
 EOF
   fi
 fi
 
-# ---------- sysctl + NAT (fresh/reinstall only; skipped for panel-only) ----------
+# ---------- sysctl + NAT + forwarding (fresh/reinstall only; skipped for panel-only) ----------
 if [[ "$MODE" != "panel-only" ]]; then
-  step "sysctl + firewall + NAT (idempotent)"
+  step "sysctl + firewall + NAT (idempotent, persistent across reboots)"
+  # Forwarding: persisted in /etc/sysctl.conf.
   if ! sysctl -n net.ipv4.ip_forward | grep -q '^1$'; then
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
   fi
-  if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
+  grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
+  # Ports and forwarding are touched ONLY if ufw is active. With ufw inactive
+  # no OS port change is needed (the cloud security group still applies).
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow 500/udp >/dev/null 2>&1 || true
     ufw allow 4500/udp >/dev/null 2>&1 || true
-    # NOTE: cloud firewall (security group) must allow UDP 500/4500 at the
-    # provider level — the OS firewall is never disabled as a shortcut.
+    ufw route allow from 10.99.0.0/24 >/dev/null 2>&1 || true
+    log "ufw is active: opened UDP 500/4500 and allowed VPN subnet routing."
+  else
+    log "ufw is not active: no OS port changes needed."
   fi
-  if ! iptables -t nat -C POSTROUTING -s 10.99.0.0/24 -o "$IFACE" -j MASQUERADE 2>/dev/null; then
-    iptables -t nat -A POSTROUTING -s 10.99.0.0/24 -o "$IFACE" -j MASQUERADE
-  fi
+
+  # NAT + forwarding rules are applied by a boot-time unit (below), which is
+  # idempotent and independent of ufw's rule reloads.
+  cat > /usr/local/sbin/aurora-nat-apply <<'NATEOF'
+#!/bin/sh
+# Managed by aurora-ikev2 install.sh — idempotent VPN NAT/forwarding rules.
+set -eu
+SUBNET="10.99.0.0/24"
+IFACE="$(ip -4 route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
+[ -n "$IFACE" ] || { echo "aurora-nat: no default interface" >&2; exit 1; }
+iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$IFACE" -j MASQUERADE 2>/dev/null \
+  || iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$IFACE" -j MASQUERADE
+if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+  iptables -C FORWARD -s "$SUBNET" -j ACCEPT 2>/dev/null \
+    || iptables -I FORWARD 1 -s "$SUBNET" -j ACCEPT
+  iptables -C FORWARD -d "$SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+    || iptables -I FORWARD 1 -d "$SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
+fi
+NATEOF
+  chmod 755 /usr/local/sbin/aurora-nat-apply
+  cat > /etc/systemd/system/aurora-nat.service <<'UNITEOF'
+[Unit]
+Description=Aurora IKEv2 VPN NAT and forwarding rules
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/aurora-nat-apply
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+  systemctl daemon-reload || warn "systemctl daemon-reload failed"
+  systemctl enable aurora-nat.service >/dev/null 2>&1 || warn "could not enable aurora-nat.service"
+  /usr/local/sbin/aurora-nat-apply
 else
   step "skipping sysctl/NAT (panel-only mode — existing VPN untouched)"
 fi
@@ -290,63 +367,80 @@ DB="$BASE_DIR/aurora.db"
 step "administrator bootstrap"
 if [[ -f "$DB" ]]; then
   log "existing admin database found — administrator access PRESERVED."
-  log "(to reset the admin password use: sudo -u $AURORA_USER $INSTALL_DIR/venv/bin/python $INSTALL_DIR/reset_admin.py)"
+  log "(to reset the admin password: sudo -u $AURORA_USER $INSTALL_DIR/venv/bin/python $INSTALL_DIR/reset_admin.py)"
 else
-  ADMIN_USER="admin"
-  ADMIN_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
-  # password generated in-process, piped via stdin; never in argv or logs
-  ADMIN_PASS="$ADMIN_PASS" AURORA_DB="$DB" ./venv/bin/python - <<'PYEOF' > "$BASE_DIR/.admin_bootstrap.txt"
-import os
+  # Restrictive umask BEFORE any secret touches disk.
+  umask 077
+  BOOTSTRAP_FILE="$BASE_DIR/.admin_bootstrap.txt"
+  # Python's secrets module: no pipelines, so no SIGPIPE failure under pipefail.
+  ADMIN_PASS="$(./venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(16))')"
+  # Password reaches the child via its environment only: never argv, never logs.
+  ADMIN_PASS="$ADMIN_PASS" AURORA_DB="$DB" ./venv/bin/python - > "$BOOTSTRAP_FILE" <<'PYEOF'
+import os, sqlite3
 from aurora.app import hash_password, init_db
-import sqlite3
-pw = os.environ["ADMIN_PASS"]
 init_db(None)
 db = sqlite3.connect(os.environ["AURORA_DB"])
-db.execute("INSERT OR IGNORE INTO admin (username, password_hash) VALUES (?,?)",
-           ("admin", hash_password(pw)))
+db.execute("INSERT OR IGNORE INTO admin (username, password_hash, must_change) VALUES (?,?,1)",
+           ("admin", hash_password(os.environ["ADMIN_PASS"])))
 db.commit()
-print("admin:" + pw)
+print("admin:" + os.environ["ADMIN_PASS"])
 PYEOF
   chown "$AURORA_USER:$AURORA_USER" "$DB"
-  chmod 600 "$DB" "$BASE_DIR/.admin_bootstrap.txt"
-  BOOTSTRAP=$(cat "$BASE_DIR/.admin_bootstrap.txt")
-  log "initial admin: ${BOOTSTRAP%%:*} / ${BOOTSTRAP#*:}   (CHANGE AFTER FIRST LOGIN)"
-  log "credentials file: $BASE_DIR/.admin_bootstrap.txt (delete after reading)"
-  unset BOOTSTRAP ADMIN_PASS
+  chmod 600 "$DB" "$BOOTSTRAP_FILE"
+  unset ADMIN_PASS
+  umask 022
+  log "initial admin account created (user: admin)."
+  log "password written to $BOOTSTRAP_FILE (mode 600) — it is NOT printed here."
+  log "read it once, delete it, and change the password at first login (required)."
 fi
 
-# ---------- sudoers: narrowly scoped whitelist for the service user ----------
-step "installing sudoers whitelist (least privilege)"
-cat > /etc/sudoers.d/aurora-panel <<EOF
-# Aurora IKEv2 Manager — exact-command whitelist for the panel service user.
-# Managed by install.sh; do not edit.
-$AURORA_USER ALL=(root) NOPASSWD: /usr/sbin/ipsec rereadsecrets, \\
-    /usr/sbin/ipsec update, \\
-    /usr/sbin/ipsec statusall, \\
-    /usr/sbin/swanctl --load-secrets, \\
-    /usr/bin/systemctl restart strongswan-starter, \\
-    /usr/bin/systemctl reload strongswan-starter
-EOF
-chmod 440 /etc/sudoers.d/aurora-panel
-visudo -c -f /etc/sudoers.d/aurora-panel >/dev/null
+# ---------- privileged helper + sudoers (generated from aurora/privileged.py) ----------
+step "installing root secrets helper and sudoers whitelist (least privilege)"
+# Root-owned and not writable by the service user. Stdlib-only, run with the
+# system python3, so no writable virtualenv is ever executed as root.
+install -d -o root -g root -m 0755 /usr/local/libexec
+install -o root -g root -m 0755 "$INSTALL_DIR/aurora/secrets_helper.py" \
+  /usr/local/libexec/aurora-secrets-helper
+# Root-only backup area OUTSIDE the service user's data directory, so the panel
+# cannot silently delete or tamper with rollback copies.
+install -d -o root -g root -m 0700 /var/lib/aurora-secrets-backups
 
-# helper script to reset admin (runs as the service user on its own DB)
+SUDO_TMP="$(mktemp)"
+( cd "$INSTALL_DIR" && ./venv/bin/python -c \
+    "import sys; from aurora.privileged import sudoers_text; sys.stdout.write(sudoers_text('$AURORA_USER'))" ) > "$SUDO_TMP"
+visudo -c -f "$SUDO_TMP" >/dev/null || { rm -f "$SUDO_TMP"; err "generated sudoers policy failed visudo"; exit 1; }
+install -o root -g root -m 0440 "$SUDO_TMP" /etc/sudoers.d/aurora-panel
+rm -f "$SUDO_TMP"
+
+# Admin reset: the new password goes to a 0600 file, never to stdout or logs.
 cat > "$INSTALL_DIR/reset_admin.py" <<'PYEOF'
 #!/usr/bin/env python3
-"""Reset the Aurora admin password. Run as the aurora service user:
-   sudo -u aurora /opt/aurora-ikev2/venv/bin/python /opt/aurora-ikev2/reset_admin.py <username>
-Generates a new random password and prints it once."""
+"""Reset an Aurora admin password. Run as the aurora service user:
+   sudo -u aurora /opt/aurora-ikev2/venv/bin/python /opt/aurora-ikev2/reset_admin.py [username]
+The new password is written to a 0600 file next to the database. The account
+must change it at next login (must_change=1)."""
 import os, secrets, sys, sqlite3
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aurora.app import hash_password
 user = sys.argv[1] if len(sys.argv) > 1 else "admin"
-db = sqlite3.connect(os.environ.get("AURORA_DB", "/var/lib/aurora-ikev2/aurora.db"))
+db_path = os.environ.get("AURORA_DB", "/var/lib/aurora-ikev2/aurora.db")
 pw = secrets.token_urlsafe(16)
-db.execute("UPDATE admin SET password_hash=?, must_change=1 WHERE username=?", (hash_password(pw), user))
+db = sqlite3.connect(db_path)
+cur = db.execute("UPDATE admin SET password_hash=?, must_change=1 WHERE username=?",
+                 (hash_password(pw), user))
 db.commit()
-if db.total_changes == 0:
+if cur.rowcount == 0:
     sys.exit(f"no such admin user: {user}")
-print(f"new password for {user}: {pw}  (change after first login)")
+out = os.path.join(os.path.dirname(db_path), ".admin_reset.txt")
+old = os.umask(0o077)
+try:
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(f"{user}:{pw}\n")
+finally:
+    os.umask(old)
+os.chmod(out, 0o600)
+print(f"new password written to {out} (mode 600).")
+print("read it once, delete the file, and change the password at next login.")
 PYEOF
 chmod 750 "$INSTALL_DIR/reset_admin.py"
 chown "$AURORA_USER:$AURORA_USER" "$INSTALL_DIR/reset_admin.py"

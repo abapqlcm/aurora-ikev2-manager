@@ -245,27 +245,53 @@ def parse_swanctl_conf(text: str) -> ExistingConfig:
     return cfg
 
 
-def inspect_existing() -> ExistingConfig:
-    """Best-effort read-only inspection of a live strongSwan installation."""
-    cfg = ExistingConfig()
-    ipsec_conf = "/etc/ipsec.conf"
-    ipsec_secrets = "/etc/ipsec.secrets"
-    swanctl_conf = "/etc/swanctl/swanctl.conf"
+def _read_text(path: str, warnings: list[str]) -> str | None:
+    """Read a config file, recording (not raising) any filesystem problem."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        warnings.append(f"cannot read {path}: {exc.strerror or exc}")
+        return None
 
-    if os.path.exists(swanctl_conf):
-        cfg = parse_swanctl_conf(open(swanctl_conf, encoding="utf-8", errors="replace").read())
-    elif os.path.exists(ipsec_conf):
-        cfg = parse_ipsec_conf(open(ipsec_conf, encoding="utf-8", errors="replace").read())
-        if os.path.exists(ipsec_secrets):
-            cfg.eap_users = parse_ipsec_secrets_usernames(
-                open(ipsec_secrets, encoding="utf-8", errors="replace").read())
+
+def inspect_existing() -> ExistingConfig:
+    """Best-effort, read-only inspection of a live strongSwan installation.
+
+    Never raises for missing or unreadable files: problems become warnings.
+    Credential names come from the root helper, never from the secrets file.
+    """
+    ipsec_conf = "/etc/ipsec.conf"
+    swanctl_conf = "/etc/swanctl/swanctl.conf"
+    warnings: list[str] = []
+
+    text = _read_text(swanctl_conf, warnings)
+    if text is not None:
+        cfg = parse_swanctl_conf(text)
+    else:
+        cfg = ExistingConfig()
+        text = _read_text(ipsec_conf, warnings)
+        if text is not None:
+            cfg = parse_ipsec_conf(text)
+            try:
+                from . import strongswan  # lazy: avoids import cycle
+                cfg.eap_users = strongswan.list_users()
+            except (CommandError, ValueError) as exc:
+                warnings.append(f"cannot list EAP users: {exc}")
 
     for d in ("/etc/ipsec.d/cacerts", "/etc/swanctl/x509ca"):
-        if os.path.isdir(d):
-            cfg.ca_certs = [f for f in os.listdir(d) if f.endswith((".pem", ".crt", ".cer"))]
+        try:
+            if os.path.isdir(d):
+                cfg.ca_certs = [f for f in os.listdir(d)
+                                if f.endswith((".pem", ".crt", ".cer"))]
+        except OSError as exc:
+            warnings.append(f"cannot list {d}: {exc.strerror or exc}")
 
     p = run(["systemctl", "is-active", "strongswan-starter"])
     if p.returncode != 0:
         p = run(["systemctl", "is-active", "strongswan"])
     cfg.service_active = p.stdout.strip() == "active"
+    cfg.warnings = warnings
     return cfg

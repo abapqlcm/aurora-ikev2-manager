@@ -33,11 +33,12 @@
         <input type="hidden" name="action" value="enable"><button>Enable</button>
         {% endif %}
       </form>
-      <form method="post" class="inline" onsubmit="return confirm('Delete user {{ u }}? Type ok in prompt');">
+      <form method="post" class="inline" data-confirm="Delete user {{ u }}? This cannot be undone.">
         <input type="hidden" name="csrf" value="{{ csrf_token() }}">
         <input type="hidden" name="username" value="{{ u }}">
-        <input type="hidden" name="confirm" value="{{ u }}">
-        <input type="hidden" name="action" value="delete"><button class="danger">Delete</button>
+        <input type="hidden" name="action" value="delete">
+        <input name="confirm" placeholder="type {{ u }}" required autocomplete="off" aria-label="Type the username to confirm">
+        <button class="danger">Delete</button>
       </form>
       <details>
         <summary>Change password</summary>

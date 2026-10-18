@@ -16,8 +16,10 @@
 - EAP credentials live in the swanctl secrets directory
   (`/etc/swanctl/secrets/`; Aurora prefers `aurora.secrets`, otherwise the
   first `*.secrets` containing EAP entries).
-- Add / delete / disable / enable / password-change edit ONLY that file,
-  then run `swanctl --load-secrets` (exact-command sudoers whitelist).
+- The panel never touches that file directly. Add / delete / disable / enable /
+  password-change go through the root secrets helper, which edits ONLY that file
+  and then runs `swanctl --load-secrets`. The helper is reached through an
+  exact-argv sudoers rule.
 - `swanctl --load-secrets` does NOT restart charon and does NOT touch
   established SAs. New authentications see changes immediately.
 
@@ -28,9 +30,10 @@
   an explanation.
 
 ## Recovery
-- Before every change the secrets file is backed up
-  (`AURORA_BACKUP_DIR`, 0600). If `--load-secrets` fails, the pre-change
-  content is restored atomically and re-applied.
+- Before every change the helper backs up the secrets file to a root-only
+  directory (`/var/lib/aurora-secrets-backups`, 0600 files, 10 newest kept). If
+  `--load-secrets` fails, the pre-change content is restored atomically and
+  re-applied. If the backup cannot be written, the change is refused.
 
 ## Limitations
 - **Active sessions:** disabling/deleting a user does NOT terminate an

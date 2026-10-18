@@ -1,24 +1,36 @@
 # Changelog
 
-## 1.4.0 — 2026-10-18 (single PKI authority + honest E2E)
-- Single authoritative PKI implementation: install.sh delegates all
-  certificate generation/validation to aurora/pki.py via the new
-  aurora/pki_cli.py root CLI (gen-ca / gen-server / replace-ca --approved /
-  validate). No certificate commands remain in the installer.
-- E2E test rewritten to exercise the REAL production module and pki_cli
-  (4096-bit CA, exact typed SAN validation, md5-verified download bytes,
-  dashboard endpoint) — clearly labeled as sandbox scope: no systemd VM,
-  no live charon, no firewall. Full clean-server install NOT claimed tested.
-- Fresh install HARD-STOP on existing strongSwan config (ipsec.conf content,
-  swanctl.conf, existing certs) with pointer to --mode existing / reinstall.
-  Nothing is changed on conflict.
-- Exact client-facing identity validation: typed SAN parsing (DNS/IP v4/v6,
-  canonicalized), openssl-based cert parsing (subject, SAN, basicConstraints,
-  expiry) — broad text search removed. conn block leftid == cert identity.
-- /ca.pem robustness: real CA-certificate parse (basicConstraints CA:TRUE,
-  unexpired) instead of PEM-header sniff; 404 missing / 500 invalid; path
-  traversal impossible (fixed path).
-- 81 unit/integration tests + 17-check E2E; CI green including E2E.
+## Unreleased — security and correctness fixes
+
+- **Privilege boundary:** the panel no longer reads or writes strongSwan secrets
+  files. Credential changes go through a stdlib-only root helper
+  (`/usr/local/libexec/aurora-secrets-helper`), reached via exact-argv sudo.
+  Works with the systemd hardening (`ProtectSystem=strict`) unchanged.
+- **Sudoers** is generated from `aurora/privileged.py`; `ipsec restart` and
+  `swanctl --load-secrets` were removed from the panel's privileges.
+- **Open redirect** after login fixed: only same-site paths are accepted.
+- **Password policy:** quotation marks and backslashes are rejected (both
+  backends); rejected input never changes a file.
+- **Deleting a disabled classic user** now removes its commented credential line.
+- **Login rate limiting** is shared across workers through SQLite.
+- **Forced password change** for bootstrap and reset accounts (`must_change`).
+- **Monitoring** reports unknown status instead of always-healthy.
+- **Config validation** is static only; the old `ipsec start --nofork` probe is gone.
+- **Dashboard** lists users from the active backend.
+- **Confirmations** use a CSP-compatible script; the server checks typed usernames.
+- **Backups:** root-only, 0600, newest 10 kept; a failed backup refuses the change.
+- **Hashing:** PBKDF2 raised to 600,000 iterations; old hashes are upgraded on login.
+- **Installer:** no password in logs; secrets generated with Python `secrets`;
+  restrictive umask before any secret is written.
+- Static file serving fixed: stylesheet now served from `aurora/templates/static`.
+- **Firewall persistence:** NAT and forwarding rules are re-applied at boot by
+  `aurora-nat.service` (idempotent, interface detected at boot). Raw FORWARD rules
+  are added only when ufw is inactive; with ufw active, `ufw route allow` is used.
+  UDP 500/4500 are opened in ufw only when ufw is active.
+- **strongSwan config:** the conn block used `dns=`, which strongSwan rejects as an
+  unknown keyword; it is now `rightdns=`. Existing installs keep the old block
+  (the installer skips an existing conn), so edit `/etc/ipsec.conf` to `rightdns=`
+  and run `sudo ipsec update`.
 
 ## 1.3.0 — 2026-10-18 (automation + standard CA naming)
 - Standard CA filename `aurora-manager-ca.pem` across installer, storage,

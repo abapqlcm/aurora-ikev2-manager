@@ -1,65 +1,123 @@
 """Aurora IKEv2 Manager — web application factory.
 
 Security model:
-- Single administrator (username in DB, password hashed with pbkdf2).
+- Single administrator (username in DB, password hashed with PBKDF2-SHA256).
 - Session cookie: HttpOnly, SameSite=Lax, 8h expiry, signed via itsdangerous.
 - CSRF token per session, required on every POST.
-- Login rate limited per remote address (5 failures / 10 min).
-- All privileged actions go through aurora.privileged helper functions which
-  use argument lists (never shell=True).
+- Login rate limit per remote address, shared across all worker processes
+  through the SQLite database (5 failures / 10 minutes).
+- A bootstrap or reset password forces a change before any other page.
+- Redirect targets after login are validated as internal paths only.
+- Credential writes go through the root secrets helper (see secrets_client).
 """
 from __future__ import annotations
 
-import hmac
 import hashlib
+import hmac
+import io
 import os
 import secrets
 import sqlite3
 import time
+import urllib.parse
 from functools import wraps
 
 from flask import (Flask, abort, flash, g, redirect, render_template, request,
                    session, url_for, send_file, Response)
 
-from . import strongswan, monitor
-from . import swanctl_users
+from . import strongswan, monitor, swanctl_users
 from .environment import detect_environment, inspect_existing, CommandError
+from .secrets_helper import password_error
+
+TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+SESSION_TTL = 8 * 3600
+# OWASP (2023) minimum for PBKDF2-HMAC-SHA256. Older hashes still verify and are
+# transparently upgraded on the next successful login (see needs_rehash).
+PBKDF2_ITERS = 600_000
+LOGIN_MAX_FAILS = 5
+LOGIN_WINDOW = 600
+
+# Endpoints reachable while a forced password change is pending.
+FORCED_CHANGE_ALLOWED = {"login", "logout", "change_password", "static"}
+
 
 def _db_path() -> str:
     return os.environ.get("AURORA_DB", "/var/lib/aurora-ikev2/aurora.db")
-SESSION_TTL = 8 * 3600
-PBKDF2_ITERS = 260_000
 
-# ----------------------------------------------------------------------- crypto
 
-def hash_password(password: str, salt: bytes | None = None) -> str:
+# ----------------------------------------------------------------- crypto
+
+def hash_password(password: str, salt: bytes | None = None,
+                  iterations: int = PBKDF2_ITERS) -> str:
     salt = salt or secrets.token_bytes(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERS)
-    return f"pbkdf2${PBKDF2_ITERS}${salt.hex()}${dk.hex()}"
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return f"pbkdf2${iterations}${salt.hex()}${dk.hex()}"
+
+
+def _parse_hash(stored: str):
+    _, iters, salt_hex, dk_hex = stored.split("$")
+    return int(iters), bytes.fromhex(salt_hex), dk_hex
 
 
 def verify_password(password: str, stored: str) -> bool:
     try:
-        _, iters, salt_hex, dk_hex = stored.split("$")
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(iters))
-        return hmac.compare_digest(dk.hex(), dk_hex)
+        iters, salt, dk_hex = _parse_hash(stored)
     except (ValueError, TypeError):
         return False
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iters)
+    return hmac.compare_digest(dk.hex(), dk_hex)
 
 
-# ----------------------------------------------------------------------- storage
+def needs_rehash(stored: str) -> bool:
+    try:
+        iters, _, _ = _parse_hash(stored)
+    except (ValueError, TypeError):
+        return True
+    return iters < PBKDF2_ITERS
+
+
+# ----------------------------------------------------------------- redirects
+
+def safe_next(target: str | None, default: str) -> str:
+    """Return `target` only if it is a same-site path; otherwise `default`.
+
+    Rejects absolute URLs, protocol-relative '//host', backslash tricks,
+    control characters and anything that still resolves to another origin
+    after percent-decoding (applied repeatedly to defeat double encoding).
+    """
+    if not target or len(target) > 512:
+        return default
+    candidate = target
+    for _ in range(3):
+        decoded = urllib.parse.unquote(candidate)
+        if decoded == candidate:
+            break
+        candidate = decoded
+    if any(ord(c) < 32 or ord(c) == 127 for c in candidate):
+        return default
+    if "\\" in candidate:
+        return default
+    if not candidate.startswith("/") or candidate.startswith("//"):
+        return default
+    parts = urllib.parse.urlsplit(candidate)
+    if parts.scheme or parts.netloc:
+        return default
+    return target
+
+
+# ----------------------------------------------------------------- storage
 
 def get_db() -> sqlite3.Connection:
     if "db" not in g:
-        g.db = sqlite3.connect(_db_path())
+        g.db = sqlite3.connect(_db_path(), timeout=10)
         g.db.row_factory = sqlite3.Row
     return g.db
 
 
-def init_db(app: Flask) -> None:
+def init_db(app=None) -> None:
     p = _db_path()
     os.makedirs(os.path.dirname(p) or ".", mode=0o700, exist_ok=True)
-    db = sqlite3.connect(p)
+    db = sqlite3.connect(p, timeout=10)
     db.executescript("""
     CREATE TABLE IF NOT EXISTS admin (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -73,6 +131,11 @@ def init_db(app: Flask) -> None:
         action TEXT NOT NULL,
         detail TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS login_attempts (
+        ip TEXT NOT NULL,
+        ts REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS login_attempts_ip ON login_attempts (ip, ts);
     """)
     db.commit()
     db.close()
@@ -88,22 +151,30 @@ def audit(action: str, detail: str = "") -> None:
         pass  # auditing must never break the request
 
 
-# ------------------------------------------------------------------- auth layer
+# ----------------------------------------------------- shared login limiter
 
-def _rate_limited(key: str, max_fails: int = 5, window: int = 600) -> bool:
-    now = time.time()
-    fails = app_login_fails.get(key, [])
-    fails = [t for t in fails if now - t < window]
-    app_login_fails[key] = fails
-    return len(fails) >= max_fails
+def login_blocked(db: sqlite3.Connection, ip: str) -> bool:
+    """True if `ip` has too many recent failures. State is shared in SQLite,
+    so every worker process sees the same counters."""
+    cutoff = time.time() - LOGIN_WINDOW
+    db.execute("DELETE FROM login_attempts WHERE ts < ?", (cutoff,))
+    row = db.execute("SELECT COUNT(*) FROM login_attempts WHERE ip = ? AND ts >= ?",
+                     (ip, cutoff)).fetchone()
+    db.commit()
+    return row[0] >= LOGIN_MAX_FAILS
 
 
-app_login_fails: dict[str, list[float]] = {}
+def record_login_failure(db: sqlite3.Connection, ip: str) -> None:
+    db.execute("INSERT INTO login_attempts (ip, ts) VALUES (?, ?)", (ip, time.time()))
+    db.commit()
 
 
-def record_fail(key: str) -> None:
-    app_login_fails.setdefault(key, []).append(time.time())
+def clear_login_failures(db: sqlite3.Connection, ip: str) -> None:
+    db.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
+    db.commit()
 
+
+# ------------------------------------------------------------- auth layer
 
 def login_required(fn):
     @wraps(fn)
@@ -128,56 +199,56 @@ def check_csrf() -> None:
         abort(400, "CSRF validation failed")
 
 
-def _swanctl_user_action(action, username, request, audit, flash):
-    """Dispatch user mutations to the swanctl backend (same restrictions
-    enforced server-side as in the UI)."""
-    ok, detail = swanctl_users.check_eap_configured()
-    if not ok:
-        flash(f"swanctl server: {detail}", "error")
-        return
-    path = swanctl_users.find_secrets_file()
-    try:
-        if action == "add":
-            swanctl_users.add_user(username, request.form.get("password", ""), path=path)
-            audit("swanctl_user_add", username)
-            flash(f"User {username} created (secrets reloaded).", "ok")
-        elif action == "delete":
-            if request.form.get("confirm", "") != username:
-                raise ValueError("type the username to confirm deletion")
-            if swanctl_users.delete_user(username, path=path):
-                audit("swanctl_user_delete", username)
-                flash(f"User {username} deleted.", "ok")
-            else:
-                flash(f"User {username} not found.", "error")
-        elif action == "disable":
-            if swanctl_users.disable_user(username, path=path):
-                audit("swanctl_user_disable", username)
-                flash(f"User {username} disabled (revoked at next "
-                      "authentication; existing sessions persist).", "ok")
-            else:
-                flash(f"User {username} not found.", "error")
-        elif action == "enable":
-            if swanctl_users.enable_user(username, path=path):
-                audit("swanctl_user_enable", username)
-                flash(f"User {username} enabled.", "ok")
-            else:
-                flash(f"User {username} not found.", "error")
-        elif action == "passwd":
-            swanctl_users.set_user_password(username,
-                                            request.form.get("password", ""),
-                                            path=path)
-            audit("swanctl_user_passwd", username)
-            flash(f"Password changed for {username}.", "ok")
-        else:
-            raise ValueError("unknown action")
-    except (ValueError, CommandError) as e:
-        flash(f"swanctl error: {e}", "error")
+def _admin_row():
+    uid = session.get("uid")
+    if not uid:
+        return None
+    return get_db().execute("SELECT * FROM admin WHERE id = ?", (uid,)).fetchone()
 
 
-# ------------------------------------------------------------------- app factory
+def _user_action(action: str, username: str, form) -> str:
+    """Apply one user mutation to the active backend. Raises ValueError/CommandError."""
+    if strongswan.stack_layout() == "swanctl":
+        ok, detail = swanctl_users.check_eap_configured()
+        if not ok:
+            raise ValueError(f"swanctl server: {detail}")
+        mod = swanctl_users
+    else:
+        mod = strongswan
+    if action == "add":
+        mod.add_user(username, form.get("password", ""))
+        audit("user_add", username)
+        return f"User {username} created."
+    if action == "delete":
+        if form.get("confirm", "") != username:
+            raise ValueError("type the username to confirm deletion")
+        if not mod.delete_user(username):
+            raise ValueError(f"User {username} not found.")
+        audit("user_delete", username)
+        return f"User {username} deleted."
+    if action in ("disable", "enable"):
+        changed = mod.disable_user(username) if action == "disable" else mod.enable_user(username)
+        if not changed:
+            raise ValueError(f"User {username} not found.")
+        audit(f"user_{action}", username)
+        return f"User {username} {action}d."
+    if action == "passwd":
+        mod.set_user_password(username, form.get("password", ""))
+        audit("user_passwd", username)
+        return f"Password changed for {username}."
+    raise ValueError("unknown action")
+
+
+def _list_entries():
+    if strongswan.stack_layout() == "swanctl":
+        return swanctl_users.list_entries()
+    return strongswan.list_entries()
+
+
+# ------------------------------------------------------------- app factory
 
 def create_app() -> Flask:
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder=os.path.join(TEMPLATE_DIR, "static"))
     app.secret_key = os.environ.get("AURORA_SECRET_KEY") or secrets.token_hex(32)
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
@@ -198,6 +269,15 @@ def create_app() -> Flask:
                                 "default-src 'self'; style-src 'self'; script-src 'self'")
         return resp
 
+    @app.before_request
+    def enforce_forced_password_change():
+        if not session.get("uid") or request.endpoint in FORCED_CHANGE_ALLOWED:
+            return None
+        row = _admin_row()
+        if row is not None and row["must_change"]:
+            return redirect(url_for("change_password"))
+        return None
+
     @app.teardown_appcontext
     def close_db(_exc):
         db = g.pop("db", None)
@@ -210,21 +290,27 @@ def create_app() -> Flask:
     def login():
         ip = request.remote_addr or "?"
         if request.method == "POST":
-            if _rate_limited(ip):
+            db = get_db()
+            if login_blocked(db, ip):
                 flash("Too many failed attempts. Try again later.", "error")
                 return render_template("login.html"), 429
             check_csrf()
             username = request.form.get("username", "").strip()
             password = request.form.get("password", "")
-            db = get_db()
             row = db.execute("SELECT * FROM admin WHERE username=?", (username,)).fetchone()
             if row and verify_password(password, row["password_hash"]):
+                if needs_rehash(row["password_hash"]):
+                    db.execute("UPDATE admin SET password_hash=? WHERE id=?",
+                               (hash_password(password), row["id"]))
+                    db.commit()
+                clear_login_failures(db, ip)
                 session.clear()
                 session["uid"] = row["id"]
                 session["ts"] = time.time()
                 audit("login_ok")
-                return redirect(request.args.get("next") or url_for("dashboard"))
-            record_fail(ip)
+                default = url_for("change_password") if row["must_change"] else url_for("dashboard")
+                return redirect(safe_next(request.args.get("next"), default))
+            record_login_failure(db, ip)
             audit("login_fail", f"ip={ip} user={username[:64]}")
             flash("Invalid credentials.", "error")
         return render_template("login.html")
@@ -235,6 +321,39 @@ def create_app() -> Flask:
         session.clear()
         return redirect(url_for("login"))
 
+    @app.route("/change-password", methods=["GET", "POST"])
+    @login_required
+    def change_password():
+        row = _admin_row()
+        if row is None:
+            session.clear()
+            return redirect(url_for("login"))
+        forced = bool(row["must_change"])
+        if request.method == "POST":
+            check_csrf()
+            current = request.form.get("current", "")
+            new = request.form.get("new", "")
+            confirm = request.form.get("confirm", "")
+            if not verify_password(current, row["password_hash"]):
+                flash("Current password is incorrect.", "error")
+            elif new != confirm:
+                flash("New passwords do not match.", "error")
+            elif hmac.compare_digest(new, current):
+                flash("Choose a password different from the current one.", "error")
+            elif (err := password_error(new)):
+                flash(err, "error")
+            else:
+                db = get_db()
+                db.execute("UPDATE admin SET password_hash=?, must_change=0 WHERE id=?",
+                           (hash_password(new), row["id"]))
+                db.commit()
+                audit("password_changed")
+                session.pop("_csrf", None)  # rotate CSRF token after credential change
+                session["ts"] = time.time()
+                flash("Password changed.", "ok")
+                return redirect(url_for("dashboard"))
+        return render_template("change_password.html", forced=forced)
+
     # ---------------- dashboard ----------------
 
     @app.route("/")
@@ -242,10 +361,11 @@ def create_app() -> Flask:
     def dashboard():
         env = detect_environment()
         status = monitor.get_status()
-        db = get_db()
-        user_count = db.execute("SELECT COUNT(*) c FROM admin WHERE 0").fetchone()["c"]
-        # users live in ipsec.secrets, not the app DB:
-        users = strongswan.list_users()
+        try:
+            users = [name for name, _ in _list_entries()]
+        except (CommandError, ValueError) as exc:
+            users = []
+            flash(f"Cannot read users: {exc}", "error")
         return render_template("dashboard.html", env=env, status=status,
                                users=users, sysinfo=_sysinfo())
 
@@ -257,50 +377,16 @@ def create_app() -> Flask:
             action = request.form.get("action", "")
             username = request.form.get("username", "").strip()
             try:
-                if strongswan.stack_layout() == "swanctl":
-                    _swanctl_user_action(action, username, request, audit, flash)
-                    return redirect(url_for("users"))
-                if action == "add":
-                    strongswan.add_user(username, request.form.get("password", ""))
-                    strongswan.reload_secrets()
-                    audit("user_add", username)
-                    flash(f"User {username} created.", "ok")
-                elif action == "delete":
-                    confirm = request.form.get("confirm", "") == username
-                    if not confirm:
-                        raise ValueError("type the username to confirm deletion")
-                    strongswan.delete_user(username)
-                    strongswan.reload_secrets()
-                    audit("user_delete", username)
-                    flash(f"User {username} deleted.", "ok")
-                elif action == "disable":
-                    strongswan.disable_user(username)
-                    strongswan.reload_secrets()
-                    audit("user_disable", username)
-                    flash(f"User {username} disabled.", "ok")
-                elif action == "enable":
-                    strongswan.enable_user(username)
-                    strongswan.reload_secrets()
-                    audit("user_enable", username)
-                    flash(f"User {username} enabled.", "ok")
-                elif action == "passwd":
-                    strongswan.set_user_password(username, request.form.get("password", ""))
-                    strongswan.reload_secrets()
-                    audit("user_passwd", username)
-                    flash(f"Password changed for {username}.", "ok")
-                else:
-                    raise ValueError("unknown action")
-            except (ValueError, strongswan.CommandError) as e:
-                flash(str(e), "error")
+                flash(_user_action(action, username, request.form), "ok")
+            except (ValueError, CommandError) as exc:
+                flash(str(exc), "error")
             return redirect(url_for("users"))
         q = request.args.get("q", "").lower()
-        if strongswan.stack_layout() == "swanctl":
-            path = swanctl_users.find_secrets_file()
-            all_users = [(u, "disabled" if d else "enabled")
-                         for u, d in swanctl_users.parse_entries(
-                             swanctl_users._read(path))]
-        else:
-            all_users = [(u, strongswan.user_state(u)) for u in strongswan.list_users()]
+        try:
+            all_users = _list_entries()
+        except (CommandError, ValueError) as exc:
+            flash(f"Cannot read users: {exc}", "error")
+            all_users = []
         if q:
             all_users = [(u, s) for u, s in all_users if q in u.lower()]
         return render_template("users.html", users=all_users, q=q)
@@ -327,7 +413,7 @@ def create_app() -> Flask:
                     flash("strongSwan restarted.", "ok")
                 else:
                     raise ValueError("unknown action")
-            except strongswan.CommandError as e:
+            except (CommandError, ValueError) as e:
                 flash(f"Operation failed: {e}", "error")
             return redirect(url_for("server"))
         env = detect_environment()
@@ -346,32 +432,28 @@ def create_app() -> Flask:
     @app.route("/ca.crt")  # legacy alias, same certificate
     @login_required
     def download_ca():
-        """Serve the exact public CA cert under the standard name.
-        The path is fixed (aurora/pki.CA_CERT) — no user input touches it,
-        so path traversal is impossible. Private keys are never exposed:
-        they live in /etc/ipsec.d/private/ and no route reads from there."""
+        """Serve the exact public CA cert. The path is fixed (aurora/pki.CA_CERT);
+        no user input touches it. Private keys are never served."""
         from . import pki
         try:
             data = pki.ca_bytes(pki.CA_CERT)
         except OSError:
             abort(404, "CA certificate not found on this server — "
                        "expected at " + pki.CA_CERT)
-        except pki.PKIError as e:
-            # file exists but is not a valid, unexpired CA certificate
-            abort(500, "CA file at " + pki.CA_CERT + " is invalid: " + str(e))
-        import io
+        if b"BEGIN CERTIFICATE" not in data:
+            abort(500, "CA file at " + pki.CA_CERT + " is not a valid PEM certificate")
         return send_file(io.BytesIO(data),
                          mimetype="application/x-pem-file",
                          as_attachment=True,
                          download_name=pki.DOWNLOAD_NAME)
 
-    # JSON status endpoint (authenticated)
     @app.route("/api/status")
     @login_required
     def api_status():
         rep = monitor.get_status()
-        return {"service": rep.service_active, "sessions": len(rep.sessions),
-                "pool": rep.pool_usage, "errors": rep.errors}
+        return {"service": rep.service_active, "daemon_up": rep.daemon_up,
+                "sessions": len(rep.sessions), "pool": rep.pool_usage,
+                "errors": rep.errors}
 
     return app
 
@@ -407,8 +489,11 @@ def _sysinfo() -> dict:
 def _diagnostics() -> dict:
     checks: dict[str, str] = {}
     checks["service"] = "active" if strongswan.service_active() else "inactive"
-    p = strongswan.run(["ipsec", "listcerts"], timeout=10)
-    checks["certs_loaded"] = str(p.stdout.count("subject")) if p.returncode == 0 else "unknown"
+    try:
+        p = strongswan.run(["ipsec", "listcerts"], timeout=10)
+        checks["certs_loaded"] = str(p.stdout.count("subject")) if p.returncode == 0 else "unknown"
+    except OSError:
+        checks["certs_loaded"] = "unknown"
     fwd = None
     try:
         with open("/proc/sys/net/ipv4/ip_forward") as fh:

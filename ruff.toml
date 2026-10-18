@@ -1,0 +1,10 @@
+# Lint policy: correctness (pyflakes) + pycodestyle errors/warnings.
+line-length = 110
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W"]
+
+[lint.per-file-ignores]
+# Pre-existing test module imports sys.path tweaks before imports.
+"tests/test_aurora.py" = ["E402"]

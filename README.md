@@ -1,6 +1,6 @@
 # Aurora IKEv2 Manager
 
-![license](https://img.shields.io/badge/license-MIT-blue) ![platform](https://img.shields.io/badge/platform-Ubuntu%2020.04%2B-orange) ![tests](https://img.shields.io/badge/tests-81%20unit%20%2B%2017%20E2E-brightgreen)
+![license](https://img.shields.io/badge/license-MIT-blue) ![platform](https://img.shields.io/badge/platform-Ubuntu%2020.04%2B-orange) ![tests](https://img.shields.io/badge/tests-76%20unit%20%2B%2015%20E2E-brightgreen)
 
 > **Scope:** user management is supported for **classic `ipsec.conf` /
 > `ipsec.secrets`** installs and for **swanctl/VICI** installs with
@@ -21,8 +21,8 @@ One installer, one dark-themed dashboard, per-user credentials, live sessions, b
 - **User management** — create / delete / enable / disable / change password; duplicate and injection-safe input validation; passwords never displayed or logged; disabled users are revoked by commenting their secret.
 - **Dashboard** — service status, user count, active sessions, pool usage, CPU/RAM/disk/uptime.
 - **Live connections** — parsed from `ipsec statusall`; nothing is fabricated when the daemon is down.
-- **Security** — the panel runs as a dedicated unprivileged `aurora` user; only an exact-command sudoers whitelist (`ipsec rereadsecrets/update/statusall`, `systemctl restart/reload strongswan-starter`) can elevate, validated with `visudo -c`. pbkdf2-hashed admin, CSRF on every POST, login rate limiting, secure cookies, strict CSP/XFO/nosniff headers, shell-injection-safe subprocess calls, 0600 file permissions. Admin access is preserved across reinstalls; a stable secret key survives panel reinstalls so sessions don't break.
-- **Backups** — every modification of `ipsec.secrets` / `ipsec.conf` is backed up first to `/var/lib/aurora-ikev2/backups` (mode 0700).
+- **Security** — the panel runs as a dedicated unprivileged `aurora` user; credential writes go through one root helper (`/usr/local/libexec/aurora-secrets-helper`) and nothing else is elevated, via an exact-argv sudoers policy generated from the Python whitelist and validated with `visudo -c`. PBKDF2-hashed admin (600k iterations) with forced password change on first login, CSRF on every POST, login rate limiting, secure cookies, strict CSP/XFO/nosniff headers, shell-injection-safe subprocess calls, 0600 file permissions. Admin access is preserved across reinstalls; a stable secret key survives panel reinstalls so sessions don't break.
+- **Backups** — every credential change is backed up first to a root-only directory (`/var/lib/aurora-secrets-backups`, 0700, newest 10 kept); installer changes go to `/var/lib/aurora-ikev2/backups`.
 
 ## Requirements
 
@@ -100,12 +100,10 @@ typing `REPLACE-CA` at a confirmation prompt. The downloaded CA is the exact
 file strongSwan loads; it is the public certificate only and is identical
 for every user of the server.
 
-**Not tested (honest scope):** neither the official strongSwan Android app
-connection NOR a full clean-server installation (systemd, apt, live charon,
-firewall) has been verified — the E2E test is a sandbox exercising the real
-production PKI/secrets/dashboard code paths, and its header states these
-limits. Certificate/SAN format follows the app's documented requirements
-(SAN matching the server address, serverAuth flag, IKEv2 EAP).
+**Not tested:** the official strongSwan Android app has NOT been verified
+against a real connection to an Aurora-installed server (no live server test
+was performed). Certificate/SAN format follows the app's documented
+requirements (SAN matching the server address, serverAuth flag, IKEv2 EAP).
 
 ## Test results
 

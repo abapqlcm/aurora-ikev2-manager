@@ -8,8 +8,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from .environment import run
+from .environment import CommandError, run
+from .privileged import effective_cmd
 from .strongswan import CONN_NAME, service_active
+
+STATUS_MARKERS = ("Status of IKE charon daemon", "Security Associations")
 
 
 @dataclass
@@ -24,7 +27,9 @@ class Session:
 
 @dataclass
 class StatusReport:
-    daemon_up: bool = False
+    # Tri-state: True = charon answered, False = service is down,
+    # None = unknown (service active but status could not be read).
+    daemon_up: bool | None = None
     service_active: bool = False
     sessions: list[Session] = field(default_factory=list)
     pool_usage: str = ""
@@ -75,12 +80,21 @@ def parse_statusall(text: str, conn: str = CONN_NAME) -> tuple[list[Session], st
 def get_status() -> StatusReport:
     rep = StatusReport(service_active=service_active())
     if not rep.service_active:
+        rep.daemon_up = False
         rep.errors.append("VPN service is not active")
         return rep
-    p = run(["ipsec", "statusall"], timeout=15)
-    if p.returncode != 0 and not p.stdout:
-        rep.errors.append(p.stderr.strip()[:300] or "ipsec statusall failed")
+    try:
+        cmd = effective_cmd(["/usr/sbin/ipsec", "statusall"])
+    except CommandError as exc:
+        rep.errors.append(str(exc))
         return rep
-    rep.daemon_up = "uptime" in p.stdout or "loaded" in p.stdout or True
+    p = run(cmd, timeout=15)
+    if p.returncode != 0:
+        rep.errors.append((p.stderr or "").strip()[:300] or "ipsec statusall failed")
+        return rep
+    if not any(marker in p.stdout for marker in STATUS_MARKERS):
+        rep.errors.append("unexpected output from ipsec statusall")
+        return rep
+    rep.daemon_up = True
     rep.sessions, rep.pool_usage = parse_statusall(p.stdout)
     return rep
