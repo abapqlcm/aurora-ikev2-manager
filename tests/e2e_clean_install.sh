@@ -6,6 +6,8 @@ set -euo pipefail
 SB=$(mktemp -d /tmp/aurora-e2e.XXXXXX)
 mkdir -p "$SB/etc/ipsec.d/"{private,cacerts,certs} "$SB/var/lib/aurora-ikev2"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+PY="$REPO/venv/bin/python"
+[[ -x "$PY" ]] || PY="$(command -v python3)"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $*"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $*"; }
@@ -67,9 +69,9 @@ export AURORA_BACKUP_DIR="$SB/backups"
 export AURORA_SKIP_RELOAD=1  # sandbox: no live charon daemon to reload
 SECRET="$SB/etc/swanctl/secrets/aurora.secrets"
 mkdir -p "$(dirname "$SECRET")"
-OUT=$("$REPO/venv/bin/python" - "$SECRET" <<'PYEOF'
+OUT=$("$PY" - "$SECRET" "$REPO" <<'PYEOF'
 import sys
-sys.path.insert(0, "/tmp/aurora-ikev2")
+sys.path.insert(0, sys.argv[2])
 from aurora import swanctl_users as su
 path = sys.argv[1]
 su.add_user("e2euser1", "E2ePass1234x", path=path)
