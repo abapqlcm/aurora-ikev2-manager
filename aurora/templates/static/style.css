@@ -1,0 +1,41 @@
+/* Aurora IKEv2 Manager — dark theme, mobile-first */
+:root {
+  --bg: #0d0f12; --panel: #16191f; --border: #262b33;
+  --text: #e6e9ee; --muted: #8b93a1;
+  --gold: #f5b800; --ok: #3fb950; --bad: #f85149; --warn: #d29922;
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg); color: var(--text); }
+main { padding: 1rem; max-width: 760px; margin: 0 auto; }
+nav { display: flex; flex-wrap: wrap; gap: .25rem; padding: .5rem 1rem;
+  background: var(--panel); border-bottom: 1px solid var(--border); }
+nav a, nav button { color: var(--muted); text-decoration: none; padding: .4rem .7rem;
+  border-radius: 8px; background: none; border: 0; font: inherit; cursor: pointer; }
+nav a.active, nav a:hover { color: var(--gold); background: #1d2129; }
+h1 { font-size: 1.35rem; } h2 { font-size: 1.05rem; color: var(--muted); }
+.grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--border);
+  border-radius: 14px; padding: 1rem; margin-bottom: 1rem; }
+.card.narrow { max-width: 420px; margin: 3rem auto; }
+code { background: #1d2129; padding: .1rem .4rem; border-radius: 6px; }
+input, button { font: inherit; padding: .5rem .7rem; border-radius: 10px;
+  border: 1px solid var(--border); background: #1d2129; color: var(--text); }
+button { background: var(--gold); color: #111; font-weight: 600; border: 0; cursor: pointer; }
+button.danger { background: var(--bad); color: #fff; }
+button.warn { background: var(--warn); }
+button.link { background: none; color: var(--muted); font-weight: 400; }
+.row { display: flex; gap: .5rem; flex-wrap: wrap; margin: .5rem 0; }
+.row input { flex: 1 1 150px; }
+table { width: 100%; border-collapse: collapse; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+th, td { padding: .55rem .6rem; text-align: left; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 600; }
+.actions form, .inline { display: inline-block; margin: 0 .2rem .2rem 0; }
+.ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+.muted { color: var(--muted); }
+.flash { padding: .6rem .9rem; border-radius: 10px; margin-bottom: .7rem;
+  border: 1px solid var(--border); }
+.flash.ok { border-color: var(--ok); } .flash.error { border-color: var(--bad); }
+footer { text-align: center; color: var(--muted); padding: 1rem; font-size: .85rem; }
+@media (max-width: 480px) { table { font-size: .9rem; } .actions details { display: block; } }

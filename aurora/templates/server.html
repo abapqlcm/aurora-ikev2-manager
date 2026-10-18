@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Server management</h1>
+<div class="grid">
+  <div class="card">
+    <h2>Controls</h2>
+    <form method="post" class="row">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <input type="hidden" name="action" value="reload"><button>Reload config</button>
+    </form>
+    <form method="post" class="row" onsubmit="return confirm('Restart strongSwan? Active sessions will drop.');">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <input type="hidden" name="action" value="restart"><button class="danger">Restart service</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Diagnostics</h2>
+    <p>Service: <span class="{{ 'ok' if diag.service == 'active' else 'bad' }}">{{ diag.service }}</span></p>
+    <p>Certs loaded: {{ diag.certs_loaded }}</p>
+    <p>IPv4 forwarding: <span class="{{ 'ok' if diag.ip_forward == 'enabled' else 'bad' }}">{{ diag.ip_forward }}</span></p>
+    <p>Existing config auth: {{ existing.auth_methods|join(', ') or 'none detected' }}</p>
+    <p>Detected users: {{ existing.eap_users|length }}</p>
+  </div>
+</div>
+{% endblock %}

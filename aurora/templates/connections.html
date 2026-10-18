@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Active connections</h1>
+<p><a href="{{ url_for('connections') }}">↻ Refresh</a></p>
+{% if status.errors %}{% for e in status.errors %}<div class="flash error">{{ e }}</div>{% endfor %}{% endif %}
+<table>
+  <tr><th>User</th><th>Virtual IP</th><th>Remote IP</th><th>IKE SA</th><th>Child SA</th></tr>
+  {% for s in status.sessions %}
+  <tr>
+    <td><code>{{ s.username }}</code></td>
+    <td>{{ s.virtual_ip or '—' }}</td>
+    <td>{{ s.remote_ip or '—' }}</td>
+    <td>{{ s.ike_sa }}</td>
+    <td>{{ s.child_sa or '—' }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5">No active sessions (or monitoring unavailable).</td></tr>
+  {% endfor %}
+</table>
+<p class="muted">{{ status.pool_usage }}</p>
+{% endblock %}

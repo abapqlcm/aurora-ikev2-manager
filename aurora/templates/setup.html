@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Client setup (Android)</h1>
+<div class="card">
+  <ol>
+    <li>Install the official <strong>strongSwan VPN Client</strong> from Google Play.</li>
+    <li>Download the CA certificate:
+        <a href="{{ url_for('download_ca') }}">aurora-vpn-ca.crt</a>
+        (requires panel login).</li>
+    <li>Android Settings → Encryption &amp; credentials → Install a certificate → CA certificate → pick the downloaded file.</li>
+    <li>In the strongSwan app: Add profile
+        <ul>
+          <li>Server: <code>{{ env.public_ip or 'YOUR_SERVER_IP' }}</code></li>
+          <li>Type: <code>IKEv2 EAP (Username/Password)</code></li>
+          <li>Username / password: as provided by the admin</li>
+          <li>CA certificate: select <em>Aurora VPN CA</em></li>
+        </ul></li>
+    <li>Connect. First connection may take a few seconds.</li>
+  </ol>
+  <p class="warn">Never share your credentials. Admins never see existing passwords.</p>
+</div>
+{% endblock %}

@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Dashboard</h1>
+<div class="grid">
+  <div class="card">
+    <h2>VPN Service</h2>
+    <p class="{{ 'ok' if status.service_active else 'bad' }}">
+      {{ 'Active' if status.service_active else 'INACTIVE' }}
+    </p>
+    <p>Public IP: <code>{{ env.public_ip or 'unknown' }}</code></p>
+    <p>Address pool: <code>10.99.0.0/24</code></p>
+    {% for e in status.errors %}<p class="bad">{{ e }}</p>{% endfor %}
+  </div>
+  <div class="card">
+    <h2>Overview</h2>
+    <p>Users: <strong>{{ users|length }}</strong></p>
+    <p>Active sessions: <strong>{{ status.sessions|length }}</strong></p>
+    <p>{{ status.pool_usage }}</p>
+  </div>
+  <div class="card">
+    <h2>System</h2>
+    <p>Load: {{ sysinfo.get('load','—') }}</p>
+    <p>RAM: {{ sysinfo.get('ram','—') }}</p>
+    <p>Disk: {{ sysinfo.get('disk','—') }}</p>
+    <p>Uptime: {{ sysinfo.get('uptime','—') }}</p>
+    <p>Arch: {{ env.arch }} · Ubuntu {{ env.os_version }}</p>
+  </div>
+</div>
+{% endblock %}

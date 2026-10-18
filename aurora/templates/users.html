@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Users</h1>
+<form method="get" class="row">
+  <input name="q" value="{{ q }}" placeholder="Search users…">
+  <button>Search</button>
+</form>
+
+<div class="card">
+  <h2>Add user</h2>
+  <form method="post" class="row">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <input type="hidden" name="action" value="add">
+    <input name="username" placeholder="username" required pattern="[A-Za-z0-9._@-]{2,64}">
+    <input name="password" type="password" placeholder="password (8-128)" required minlength="8" maxlength="128">
+    <button>Add</button>
+  </form>
+</div>
+
+<table>
+  <tr><th>User</th><th>State</th><th>Actions</th></tr>
+  {% for u, st in users %}
+  <tr>
+    <td><code>{{ u }}</code></td>
+    <td><span class="{{ 'ok' if st == 'enabled' else 'warn' }}">{{ st }}</span></td>
+    <td class="actions">
+      <form method="post" class="inline">
+        <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+        <input type="hidden" name="username" value="{{ u }}">
+        {% if st == 'enabled' %}
+        <input type="hidden" name="action" value="disable"><button class="warn">Disable</button>
+        {% else %}
+        <input type="hidden" name="action" value="enable"><button>Enable</button>
+        {% endif %}
+      </form>
+      <form method="post" class="inline" onsubmit="return confirm('Delete user {{ u }}? Type ok in prompt');">
+        <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+        <input type="hidden" name="username" value="{{ u }}">
+        <input type="hidden" name="confirm" value="{{ u }}">
+        <input type="hidden" name="action" value="delete"><button class="danger">Delete</button>
+      </form>
+      <details>
+        <summary>Change password</summary>
+        <form method="post" class="row">
+          <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+          <input type="hidden" name="action" value="passwd">
+          <input type="hidden" name="username" value="{{ u }}">
+          <input name="password" type="password" placeholder="new password" required minlength="8" maxlength="128">
+          <button>Save</button>
+        </form>
+      </details>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="3">No users found.</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}
