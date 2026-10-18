@@ -1,6 +1,13 @@
 # Aurora IKEv2 Manager
 
-![license](https://img.shields.io/badge/license-MIT-blue) ![platform](https://img.shields.io/badge/platform-Ubuntu%2020.04%2B-orange) ![tests](https://img.shields.io/badge/tests-26%20passing-brightgreen)
+![license](https://img.shields.io/badge/license-MIT-blue) ![platform](https://img.shields.io/badge/platform-Ubuntu%2020.04%2B-orange) ![tests](https://img.shields.io/badge/tests-42%20passing-brightgreen)
+
+> **Scope (MVP):** full user management is supported on **classic `ipsec.conf` /
+> `ipsec.secrets`** strongSwan installs only. swanctl/VICI installs are detected
+> and the panel is installed **read-only** (monitoring + diagnostics, user
+> management disabled) — existing swanctl config is never touched.
+> This project should be considered **beta**, not production-ready: the VPN
+> datapath itself has not been verified end-to-end on a live server.
 
 A self-hosted, mobile-friendly web manager for **strongSwan IKEv2 VPN servers** on Ubuntu.
 One installer, one dark-themed dashboard, per-user credentials, live sessions, backups, diagnostics — no third-party SaaS.
@@ -8,12 +15,12 @@ One installer, one dark-themed dashboard, per-user credentials, live sessions, b
 ## Features
 
 - **Fresh install mode** — detects Ubuntu version/arch/public IP/interface, installs strongSwan, generates a CA + server cert, configures IKEv2 with EAP-MSCHAPv2, sets up NAT/forwarding, verifies the daemon actually loads the connection.
-- **Existing server mode** — inspects the current strongSwan config first, preserves users/certs, and *refuses* to touch incompatible setups (e.g. swanctl-based).
+- **Existing server mode** — inspects the current strongSwan config first, preserves users/certs, never restarts the daemon, and installs panel-only. swanctl installs get a read-only panel (user management off), clearly announced during install.
 - **Reinstall mode** — explicit, interactive confirmation, automatic backup first, never deletes by default.
 - **User management** — create / delete / enable / disable / change password; duplicate and injection-safe input validation; passwords never displayed or logged; disabled users are revoked by commenting their secret.
 - **Dashboard** — service status, user count, active sessions, pool usage, CPU/RAM/disk/uptime.
 - **Live connections** — parsed from `ipsec statusall`; nothing is fabricated when the daemon is down.
-- **Security** — pbkdf2-hashed admin, CSRF on every POST, login rate limiting, secure cookies, strict CSP/XFO/nosniff headers, shell-injection-safe subprocess calls, 0600 file permissions.
+- **Security** — the panel runs as a dedicated unprivileged `aurora` user; only an exact-command sudoers whitelist (`ipsec rereadsecrets/update/statusall`, `systemctl restart/reload strongswan-starter`) can elevate, validated with `visudo -c`. pbkdf2-hashed admin, CSRF on every POST, login rate limiting, secure cookies, strict CSP/XFO/nosniff headers, shell-injection-safe subprocess calls, 0600 file permissions. Admin access is preserved across reinstalls; a stable secret key survives panel reinstalls so sessions don't break.
 - **Backups** — every modification of `ipsec.secrets` / `ipsec.conf` is backed up first to `/var/lib/aurora-ikev2/backups` (mode 0700).
 
 ## Requirements
@@ -86,7 +93,9 @@ Full guide: [docs/android-setup.md](docs/android-setup.md)
 | Secrets file permissions (0600) | ✅ unit-tested |
 | `ipsec statusall` parsing | ✅ unit-tested against real output format |
 | Login, CSRF, rate limiting, security headers, XSS escaping | ✅ unit-tested (Flask test client) |
+| Installer logic (service user, sudoers whitelist, no-restart panel-only, admin preservation) | ✅ static assertions unit-tested |
 | Real VPN connect / simultaneous sessions / NAT traversal | ⚠️ requires a real Ubuntu server with public IP — **not verified in the dev environment** |
+| Privilege separation on a real systemd host (`sudo -n` path, NoNewPrivileges+ProtectSystem interplay) | ⚠️ logic unit-tested; needs a real host run |
 
 ## Limitations
 

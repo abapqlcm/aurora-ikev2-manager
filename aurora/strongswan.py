@@ -18,11 +18,24 @@ import tempfile
 from dataclasses import dataclass
 
 from .environment import run_ok, run, CommandError
+from .privileged import effective_cmd
 
 IPSEC_CONF = "/etc/ipsec.conf"
 IPSEC_SECRETS = "/etc/ipsec.secrets"
 BACKUP_DIR = os.environ.get("AURORA_BACKUP_DIR", "/var/lib/aurora-ikev2/backups")
 CONN_NAME = "aurora-ikev2"
+SWANCTL_CONF = "/etc/swanctl/swanctl.conf"
+
+
+def stack_layout(
+        swanctl_conf: str = "/etc/swanctl/swanctl.conf",
+        ipsec_conf: str = IPSEC_CONF) -> str:
+    """'classic' | 'swanctl' | 'none' — which strongSwan config layout exists."""
+    if os.path.exists(swanctl_conf):
+        return "swanctl"
+    if os.path.exists(ipsec_conf):
+        return "classic"
+    return "none"
 POOL_NAME = "aurora-pool"
 VPN_POOL = "10.99.0.0/24"
 
@@ -225,12 +238,14 @@ def validate_ipsec_conf(path: str = IPSEC_CONF) -> tuple[bool, str]:
 
 
 def reload_secrets() -> None:
-    run_ok(["ipsec", "rereadsecrets"], timeout=15)
+    run_ok(effective_cmd(["/usr/sbin/ipsec", "rereadsecrets"]), timeout=15)
 
 
 def reload_full() -> None:
-    run_ok(["ipsec", "update"], timeout=15)
-    run_ok(["ipsec", "rereadsecrets"], timeout=15)
+    # `ipsec update` re-reads ipsec.conf without restarting charon — never
+    # kills existing sessions. Avoid restarts wherever update suffices.
+    run_ok(effective_cmd(["/usr/sbin/ipsec", "update"]), timeout=15)
+    run_ok(effective_cmd(["/usr/sbin/ipsec", "rereadsecrets"]), timeout=15)
 
 
 def service_active() -> bool:
@@ -242,4 +257,4 @@ def service_active() -> bool:
 
 
 def restart_service() -> None:
-    run_ok(["systemctl", "restart", "strongswan-starter"], timeout=60)
+    run_ok(effective_cmd(["/usr/bin/systemctl", "restart", "strongswan-starter"]), timeout=60)

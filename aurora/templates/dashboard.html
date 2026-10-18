@@ -7,7 +7,9 @@
     <p class="{{ 'ok' if status.service_active else 'bad' }}">
       {{ 'Active' if status.service_active else 'INACTIVE' }}
     </p>
-    <p>Public IP: <code>{{ env.public_ip or 'unknown' }}</code></p>
+    <p>Address: <code>{{ env.public_ip or 'unknown' }}</code>
+       <span class="{{ 'ok' if env.ip_class == 'public' else 'warn' }}">{{ env.ip_class }}</span></p>
+    {% if env.ip_note %}<p class="muted">{{ env.ip_note }}</p>{% endif %}
     <p>Address pool: <code>10.99.0.0/24</code></p>
     {% for e in status.errors %}<p class="bad">{{ e }}</p>{% endfor %}
   </div>

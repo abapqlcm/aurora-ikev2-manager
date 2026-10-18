@@ -240,3 +240,132 @@ class TestPasswordHashing:
     def test_never_plaintext(self):
         pw = "VeryS3cret!"
         assert pw not in hash_password(pw)
+
+
+# ------------------------------------------------- hardening tests (v1.1)
+
+import aurora.privileged as privileged
+from aurora import environment
+
+
+class TestPrivilegeSeparation:
+    def test_unprivileged_without_sudo_refuses(self, monkeypatch):
+        monkeypatch.setattr(os, "geteuid", lambda: 1000)
+        monkeypatch.delenv("AURORA_USE_SUDO", raising=False)
+        with pytest.raises(Exception):
+            privileged.effective_cmd(["/usr/sbin/ipsec", "restart"])
+
+    def test_unprivileged_whitelisted_gets_sudo(self, monkeypatch):
+        monkeypatch.setattr(os, "geteuid", lambda: 1000)
+        monkeypatch.setenv("AURORA_USE_SUDO", "1")
+        cmd = privileged.effective_cmd(["/usr/sbin/ipsec", "rereadsecrets"])
+        assert cmd == ["sudo", "-n", "/usr/sbin/ipsec", "rereadsecrets"]
+
+    def test_unprivileged_nonwhitelisted_rejected(self, monkeypatch):
+        monkeypatch.setattr(os, "geteuid", lambda: 1000)
+        monkeypatch.setenv("AURORA_USE_SUDO", "1")
+        with pytest.raises(Exception, match="whitelist"):
+            privileged.effective_cmd(["/bin/rm", "-rf", "/"])
+        with pytest.raises(Exception, match="whitelist"):
+            privileged.effective_cmd(["/usr/sbin/ipsec", "start"])
+
+    def test_root_runs_directly(self, monkeypatch):
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        assert privileged.effective_cmd(["/usr/sbin/ipsec", "update"]) == ["/usr/sbin/ipsec", "update"]
+
+
+class TestAddressClassification:
+    def test_public(self):
+        r = environment.classify_address("93.184.216.34")
+        assert r["class"] == "public" and not r["needs_public_ip"]
+
+    def test_private_nat(self):
+        r = environment.classify_address("10.0.5.9")
+        assert r["class"] == "private" and r["needs_public_ip"]
+        assert "cloud NAT" in r["note"]
+
+    def test_loopback(self):
+        assert environment.classify_address("127.0.0.1")["class"] == "loopback"
+
+    def test_none(self):
+        assert environment.classify_address(None)["needs_public_ip"]
+
+
+class TestExistingServer:
+    def test_swanctl_detected_and_marked(self):
+        cfg = environment.parse_swanctl_conf(
+            "connections { vpn {\n local-1 { auth = pubkey }\n"
+            " remote-1 { auth = eap-mschapv2 }\n }\n}\n")
+        assert cfg.uses_swanctl is True
+
+    def test_classic_eap_users_extracted(self):
+        users = environment.parse_ipsec_secrets_usernames(
+            '"alice" : EAP "secret1"\n# disabled by aurora: "bob" : EAP "x"\n')
+        assert "alice" in users
+
+    def test_layout_detection(self, tmp_path):
+        sc = str(tmp_path / "swanctl.conf")
+        ic = str(tmp_path / "nope.conf")
+        open(sc, "w").write("connections {}\n")
+        assert strongswan.stack_layout(sc, ic) == "swanctl"
+        os.remove(sc)
+        open(ic, "w").write("conn x\n")
+        assert strongswan.stack_layout(sc, ic) == "classic"
+        assert strongswan.stack_layout(str(tmp_path / "a"), str(tmp_path / "b")) == "none"
+
+    def test_user_mgmt_blocked_on_swanctl(self, client, monkeypatch):
+        # panel must refuse user mutations when swanctl layout detected
+        import re as _re
+        r = client.get("/login")
+        csrf = _re.search(r'name="csrf" value="([0-9a-f]+)"',
+                          r.get_data(as_text=True)).group(1)
+        client.post("/login", data={"username": "admin", "password": "TestPass123",
+                                    "csrf": csrf})
+        monkeypatch.setattr(strongswan, "stack_layout", lambda: "swanctl")
+        r = client.post("/users", data={
+            "action": "add", "username": "eve", "password": "Password1",
+            "csrf": session_csrf(client)})
+        assert r.status_code == 302  # flash + redirect, no mutation
+        # add_user must NOT have been called (mock would have recorded via list_users)
+        assert "eve" not in strongswan.list_users()
+
+
+def session_csrf(client):
+    import re
+    r = client.get("/login")
+    return re.search(r'name="csrf" value="([0-9a-f]+)"',
+                     r.get_data(as_text=True)).group(1)
+
+
+class TestInstallerHelpers:
+    def test_install_sh_bash_syntax(self):
+        import subprocess
+        p = subprocess.run(["bash", "-n",
+                            os.path.join(os.path.dirname(os.path.dirname(
+                                os.path.abspath(__file__))), "install.sh")],
+                           capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+
+    def test_install_sh_unprivileged_service(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "install.sh")
+        text = open(path).read()
+        assert "User=$AURORA_USER" in text or "User=aurora" in text
+        assert "User=root" not in text.split("aurora-panel.service")[-1]
+        assert "NOPASSWD" in text  # sudoers whitelist present
+        assert "visudo -c" in text  # sudoers validated
+
+    def test_install_sh_no_restart_in_panel_only(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "install.sh")
+        text = open(path).read()
+        po = text.split('else\n  step "verifying existing strongSwan')[0]
+        # in panel-only branch there must be no ipsec restart
+        assert "ipsec restart" not in text
+        assert "ipsec update" in text  # non-disruptive reload instead
+
+    def test_install_sh_preserves_admin(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "install.sh")
+        text = open(path).read()
+        assert "PRESERVED" in text  # admin access kept on reinstall

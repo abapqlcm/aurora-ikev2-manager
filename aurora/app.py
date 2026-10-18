@@ -209,6 +209,10 @@ def create_app() -> Flask:
             check_csrf()
             action = request.form.get("action", "")
             username = request.form.get("username", "").strip()
+            if strongswan.stack_layout() == "swanctl":
+                flash("This server uses swanctl — Aurora user management is "
+                      "disabled (read-only panel).", "error")
+                return redirect(url_for("users"))
             try:
                 if action == "add":
                     strongswan.add_user(username, request.form.get("password", ""))

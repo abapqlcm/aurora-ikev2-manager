@@ -42,6 +42,8 @@ class Environment:
     supported: bool = False
     reasons: list[str] = field(default_factory=list)
     public_ip: str | None = None
+    ip_class: str = "unknown"
+    ip_note: str = ""
     default_interface: str | None = None
     has_strongswan: bool = False
     swanctl_available: bool = False
@@ -67,17 +69,56 @@ def detect_arch() -> str:
     return {"x86_64": "amd64", "aarch64": "arm64"}.get(m, m)
 
 
+def _classify_ip(ip: str) -> str:
+    """'public' | 'private' | 'loopback' | 'link-local' | 'unknown'."""
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return "unknown"
+    if addr.is_loopback:
+        return "loopback"
+    if addr.is_link_local:
+        return "link-local"
+    if addr.is_private:
+        return "private"
+    return "public" if addr.version == 4 else "public"
+
+
 def detect_public_ip() -> str | None:
-    """Resolve the public IPv4 used for outbound traffic (no external POSTs)."""
+    """Return the source IPv4 for outbound traffic (local detection only,
+    no external services). May be a private/NATed address — callers must
+    classify the result with classify_address()."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(3)
         s.connect(("1.1.1.1", 443))
         ip = s.getsockname()[0]
         s.close()
-        return ip if not ip.startswith(("10.", "192.168.", "172.")) or True else None
+        return ip
     except OSError:
         return None
+
+
+def classify_address(ip: str | None) -> dict:
+    """Classify a detected address: is it routable, private/NATed, etc.
+
+    Returns {"ip": ..., "class": ..., "needs_public_ip": bool, "note": str}.
+    A private address behind 1:1 cloud NAT still works for clients reaching
+    the server by the cloud IP, but the certificate SAN and leftid must use
+    the public cloud IP, not the private one.
+    """
+    if not ip:
+        return {"ip": None, "class": "unknown", "needs_public_ip": True,
+                "note": "no outbound address detected"}
+    cls = _classify_ip(ip)
+    if cls == "public":
+        return {"ip": ip, "class": "public", "needs_public_ip": False,
+                "note": "public address detected"}
+    return {"ip": ip, "class": cls, "needs_public_ip": True,
+            "note": f"{cls} address — likely behind cloud NAT; pass the "
+                    "public cloud IP explicitly via --public-ip so certificate "
+                    "SAN and leftid match what clients connect to"}
 
 
 def detect_default_interface() -> str | None:
@@ -106,6 +147,9 @@ def detect_environment() -> Environment:
     env.os_id, env.os_version = detect_os()
     env.arch = detect_arch()
     env.public_ip = detect_public_ip()
+    _cls = classify_address(env.public_ip)
+    env.ip_class = _cls["class"]
+    env.ip_note = _cls["note"]
     env.default_interface = detect_default_interface()
     env.has_strongswan, env.swanctl_available, env.ipsec_available = detect_strongswan()
 
